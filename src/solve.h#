@@ -1,0 +1,226 @@
+use "std -> fs" from "fs"
+mod pure
+mod conf
+mod policy
+mod meta
+
+;; Rozwiązywanie zależności przez satsolv (libsolv) — zamiast `dnf install`.
+;;
+;;   zainstalowane  = repo `@installed` z installed.xml (może być puste → bootstrap obrazu)
+;;   dostępne       = primary.xml każdego włączonego repo
+;;   atrapy         = repo `legendaryos-compat` generowane z polityki (Provides: systemd = <wersja repo>)
+;;   zadania        = install <want…>, erase <exclude + erase…> (erase na niezainstalowanym = zakaz instalacji)
+;;
+;; Wynik: lista kroków z indeksów repo (sha256, lokalizacja, rozmiar). Atrapy są odfiltrowywane.
+;; Stałe solvera podajemy liczbami (README satsolv: ścieżki do stałych w aliasie kompilują się do 0):
+;;   flaga 7 = SOLVER_FLAG_IGNORE_RECOMMENDED.
+
+pub struct Solution is
+    pub ok:       bool
+    pub error:    string
+    pub problems: [string]
+    pub steps:    [pure::Step]
+end
+
+fn fail(msg: string) -> Solution is
+    return Solution { ok: false, error: msg, problems: [], steps: [] }
+end
+
+;; Plik rpm-md z atrapami z polityki ("" gdy brak atrap albo błąd w `err`).
+fn write_stubs(cache: string, repos: [conf::Repo], pol: policy::Policy, path: string) -> string is
+    let mut xml: string = ""
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < pol.stub_names.len() is
+        let mut evr: string = pol.stub_versions[i]
+        if pure::starts_with(evr, "from-repo:") is
+            evr = meta::latest_version(cache, repos, evr[10..evr.len()])
+            if evr == "" is return "atrapa '" + pol.stub_names[i] + "': pakiet '" + pol.stub_versions[i] + "' nie istnieje w repozytoriach" end
+        end
+        let v: [string] = pure::split_evr(evr)
+        xml = xml + pure::stub_package_xml(pol.stub_names[i], v[0], v[1], v[2], pure::split(pol.stub_provides[i], ","))
+        n += 1
+        i += 1
+    end
+    if !fs::write(path, pure::metadata_header(n) + xml + pure::metadata_footer()) is return "nie można zapisać " + path end
+    return ""
+end
+
+;; Dopasowanie NEVRA z planu do wpisów indeksu (jedno przejście gawk na repo).
+fn lookup(cache: string, repos: [conf::Repo], nevras: [string]) -> [pure::Step] is
+    let wants: string = ft::text::path_join(cache, "wants.nevra")
+    let w: bool = fs::write(wants, pure::join(nevras, "\n") + "\n")
+    let prog: string = pure::aw("BEGIN@L@while((getline l<wants)>0) w[l]=1@R@ @L@ e=($2==@Q@0@Q@||$2==@Q@@Q@)?@Q@@Q@:$2@Q@:@Q@; k=$1@Q@-@Q@e$3@Q@-@Q@$4@Q@.@Q@$5; if(k in w) print r@Q@@T@@Q@$0 @R@")
+    let mut out: [pure::Step] = []
+    let mut seen: [string] = []
+    let mut i: int = 0
+    while i < repos.len() is
+        if repos[i].enabled && fs::exists(meta::index_tsv(cache, repos[i].name)) is
+            let r: sys::Exec = ft::sys::exec("gawk -F " + ft::sys::sq(pure::tab()) + " -v wants=" + ft::sys::sq(wants) + " -v r=" + ft::sys::sq(repos[i].name) + " " + ft::sys::sq(prog) + " " + ft::sys::sq(meta::index_tsv(cache, repos[i].name)))
+            let ls: [string] = ft::text::lines(r.out)
+            let mut k: int = 0
+            while k < ls.len() is
+                if ls[k] != "" is
+                    let s: pure::Step = pure::step_from_line(ls[k])
+                    let key: string = pure::nevra(s)
+                    let mut dup: bool = false
+                    let mut d: int = 0
+                    while d < seen.len() is
+                        if seen[d] == key is dup = true end
+                        d += 1
+                    end
+                    if !dup is
+                        seen.push(key)
+                        out.push(s)
+                    end
+                end
+                k += 1
+            end
+        end
+        i += 1
+    end
+    ft::sys::rm_f(wants)
+    return out
+end
+
+;; Główna funkcja. `installed_xml` = "" → nic nie jest zainstalowane (budowa obrazu).
+pub fn resolve(cache: string, repos: [conf::Repo], pol: policy::Policy, arch: string,
+               installed_xml: string, want: [string], erase: [string]) -> Solution is
+    let mut k: int = 0
+    while k < want.len() is
+        if !pure::safe_name(want[k]) is return fail("niepoprawna nazwa pakietu: '" + want[k] + "'") end
+        k += 1
+    end
+    let p: int = sv::pool::new()
+    sv::pool::set_arch(p, arch)
+    let mut handles: [int] = []
+
+    ;; zainstalowane
+    let inst: int = sv::repo::new(p, "@installed")
+    if installed_xml != "" && fs::exists(installed_xml) is
+        let r0 = sv::repo::add_rpmmd_file(p, inst, installed_xml)
+        if !sv::result::is_ok(r0) is
+            let m0: string = sv::result::error_message(r0)
+            sv::repo::destroy(inst, false)
+            sv::pool::destroy(p)
+            return fail("installed.xml: " + m0)
+        end
+    end
+    sv::pool::set_installed_repo(p, inst)
+    sv::repo::finalize(inst)
+    handles.push(inst)
+
+    ;; dostępne
+    let mut i: int = 0
+    while i < repos.len() is
+        if repos[i].enabled is
+            let px: string = meta::primary_xml(cache, repos[i].name)
+            if !fs::exists(px) is
+                sv::pool::destroy(p)
+                return fail("brak metadanych repo '" + repos[i].name + "' — uruchom synchronizację (lpm sync)")
+            end
+            let h: int = sv::repo::new(p, repos[i].name)
+            let r1 = sv::repo::add_rpmmd_file(p, h, px)
+            if !sv::result::is_ok(r1) is
+                let m1: string = sv::result::error_message(r1)
+                sv::pool::destroy(p)
+                return fail("repo " + repos[i].name + ": " + m1)
+            end
+            sv::repo::finalize(h)
+            handles.push(h)
+        end
+        i += 1
+    end
+
+    ;; atrapy
+    if pol.stub_names.len() > 0 is
+        let sp: string = ft::text::path_join(cache, "stubs.xml")
+        let se: string = write_stubs(cache, repos, pol, sp)
+        if se != "" is
+            sv::pool::destroy(p)
+            return fail(se)
+        end
+        let hs: int = sv::repo::new(p, "legendaryos-compat")
+        let r2 = sv::repo::add_rpmmd_file(p, hs, sp)
+        if !sv::result::is_ok(r2) is
+            let m2: string = sv::result::error_message(r2)
+            sv::pool::destroy(p)
+            return fail("atrapy compat: " + m2)
+        end
+        sv::repo::finalize(hs)
+        handles.push(hs)
+    end
+
+    sv::pool::create_whatprovides(p)
+    let jobs: int = sv::queue::new()
+    let mut w: int = 0
+    while w < want.len() is
+        sv::job::install_name(jobs, p, want[w])
+        w += 1
+    end
+    let mut x: int = 0
+    while x < pol.exclude.len() is
+        sv::job::erase_name(jobs, p, pol.exclude[x])
+        x += 1
+    end
+    let mut y: int = 0
+    while y < erase.len() is
+        sv::job::erase_name(jobs, p, erase[y])
+        y += 1
+    end
+    let s: int = sv::solver::new(p)
+    if !pol.weak_deps is
+        let f0: i32 = sv::solver::set_flag_value(s, 7, true)
+    end
+    let nprob: i32 = sv::solver::run(s, jobs)
+    if nprob > 0 is
+        let probs: [string] = sv::solver::all_problems_as_strings(s)
+        sv::queue::destroy(jobs)
+        sv::solver::destroy(s)
+        sv::pool::destroy(p)
+        return Solution { ok: false, error: "nie da się rozwiązać zależności", problems: probs, steps: [] }
+    end
+    let plan = sv::transaction::build_plan(p, s)
+    let lines: [string] = sv::transaction::plan_lines(plan)
+    sv::queue::destroy(jobs)
+    sv::solver::destroy(s)
+    let mut z: int = 0
+    while z < handles.len() is
+        sv::repo::destroy(handles[z], false)
+        z += 1
+    end
+    sv::pool::destroy(p)
+
+    ;; install/upgrade/downgrade/reinstall → NEVRA (bez atrap)
+    let mut nevras: [string] = []
+    let mut l: int = 0
+    while l < lines.len() is
+        let pl: [string] = pure::split_plan_line(lines[l])
+        l += 1
+        if pl[0] == "install" || pl[0] == "upgrade" || pl[0] == "downgrade" || pl[0] == "reinstall" is
+            nevras.push(pl[1])
+        end
+    end
+    let found: [pure::Step] = lookup(cache, repos, nevras)
+    let mut steps: [pure::Step] = []
+    let mut f: int = 0
+    while f < found.len() is
+        if !pure::is_stub(found[f].name) is steps.push(found[f]) end
+        f += 1
+    end
+    ;; każdy NEVRA (poza atrapami) musi mieć wpis w indeksie
+    let mut n: int = 0
+    while n < nevras.len() is
+        let mut hit: bool = false
+        let mut m: int = 0
+        while m < found.len() is
+            if pure::nevra(found[m]) == nevras[n] is hit = true end
+            m += 1
+        end
+        if !hit && !pure::starts_with(nevras[n], pure::stub_prefix()) is
+            return fail("brak wpisu w indeksie repo dla " + nevras[n] + " (odśwież metadane)")
+        end
+        n += 1
+    end
+    return Solution { ok: true, error: "", problems: [], steps: pure::order_steps(steps) }
+end
