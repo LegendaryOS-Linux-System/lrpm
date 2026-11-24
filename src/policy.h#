@@ -1,0 +1,73 @@
+mod pure
+
+;; Polityka zgodności (compat.hk) — rozwiązuje problem „pakiety wymagają systemd, a PID 1 to zenitd”.
+;; Pełny opis: docs/POLICY.md.
+;;
+;;   [stub]                           ! atrapa: spełnia `Requires:`, nie instaluje żadnych plików
+;;   -> systemd
+;;   --> provides => [systemd, systemd-units]
+;;   --> version  => from-repo:systemd     ! wersja jak w repo (albo literalnie: 258-1)
+;;   [exclude]                        ! nigdy nie instaluj (solver traktuje jako zakazane)
+;;   -> packages => [systemd, systemd-resolved]
+;;   [hooks]                          ! polecenia po rozpakowaniu (w chroocie / na żywym systemie)
+;;   -> run => [ldconfig, update-ca-trust]
+;;   [solver]
+;;   -> weak-deps => false            ! odpowiednik install_weak_deps=False
+
+pub struct Policy is
+    pub stub_names:    [string]
+    pub stub_provides: [string]    ;; równolegle do stub_names: nazwy po przecinku
+    pub stub_versions: [string]    ;; "from-repo:<pkg>" albo "epoch:ver-rel"
+    pub exclude:       [string]
+    pub hooks:         [string]
+    pub weak_deps:     bool
+end
+
+pub fn empty() -> Policy is
+    return Policy { stub_names: [], stub_provides: [], stub_versions: [], exclude: [], hooks: [], weak_deps: false }
+end
+
+pub fn load(path: string) -> Policy is
+    if path == "" is return empty() end
+    let mut names: [string] = []
+    let mut provs: [string] = []
+    let mut vers: [string] = []
+    let keys: [string] = ft::api::hk_keys(path, "stub")
+    let mut i: int = 0
+    while i < keys.len() is
+        let k: string = keys[i]
+        i += 1
+        if pure::ends_with(k, ".provides") is
+            let name: string = k[0..k.len() - 9]
+            names.push(name)
+            provs.push(pure::join(ft::api::hk_list(path, "stub", k), ","))
+            vers.push(ft::api::hk_get(path, "stub", name + ".version", "from-repo:" + name))
+        end
+    end
+    return Policy { stub_names: names, stub_provides: provs, stub_versions: vers,
+        exclude: ft::api::hk_list(path, "exclude", "packages"),
+        hooks: ft::api::hk_list(path, "hooks", "run"),
+        weak_deps: ft::api::hk_get_bool(path, "solver", "weak-deps", false) }
+end
+
+;; Problemy polityki (nazwy trafiają do poleceń i XML — muszą być bezpieczne).
+pub fn validate(p: Policy) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < p.stub_names.len() is
+        if !pure::safe_name(p.stub_names[i]) is out.push("stub: niepoprawna nazwa '" + p.stub_names[i] + "'") end
+        let pv: [string] = pure::split(p.stub_provides[i], ",")
+        let mut k: int = 0
+        while k < pv.len() is
+            if !pure::safe_name(pv[k]) is out.push("stub " + p.stub_names[i] + ": niepoprawne provides '" + pv[k] + "'") end
+            k += 1
+        end
+        i += 1
+    end
+    let mut e: int = 0
+    while e < p.exclude.len() is
+        if !pure::safe_name(p.exclude[e]) is out.push("exclude: niepoprawna nazwa '" + p.exclude[e] + "'") end
+        e += 1
+    end
+    return out
+end
