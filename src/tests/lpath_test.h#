@@ -1,0 +1,53 @@
+use "std -> test" from "test"
+mod pure
+mod lpath
+
+;; Testy lpath (przeniesione z lpm/src/tests/plan_test.h# i plan2_test.h#). Bez bibliotek bit.
+;; Uruchom: h# test src/tests/lpath_test.h#   (STATUS: niezweryfikowane — brak kompilatora w sesji autora)
+
+fn eq(a: string, b: string) is
+    if a != b is test::assert_true(false) end
+end
+
+#[test]
+fn map_path_rules() is
+    eq(lpath::map_path("usr/bin/htop"), "system/bin/htop")
+    eq(lpath::map_path("usr"), "system")
+    eq(lpath::map_path("etc/htoprc"), "system/etc/htoprc")
+    eq(lpath::map_path("lib64/ld.so"), "system/lib64/ld.so")
+    eq(lpath::map_path("opt/x"), "system/opt/x")
+    eq(lpath::map_path("var/lib/x"), "")
+    eq(lpath::map_path("home/u"), "")
+    test::assert_true(lpath::is_state_path("var/log"))
+    test::assert_false(lpath::is_state_path("usr/bin"))
+end
+
+fn node(name: string, req: [string], prov: [string]) -> lpath::Node is
+    return lpath::Node { name: name, requires: req, provides: prov }
+end
+
+#[test]
+fn order_puts_dependencies_first() is
+    let nodes: [lpath::Node] = [node("app", ["libfoo >= 1", "rpmlib(x)"], []),
+        node("libfoo", ["libbar"], ["libfoo", "libfoo.so.1()(64bit)"]), node("libbar", [], ["libbar"])]
+    let o: lpath::Order = lpath::order(nodes)
+    test::assert_eq(o.order.len(), 3)
+    test::assert_eq(o.order[0], 2)
+    test::assert_eq(o.order[1], 1)
+    test::assert_eq(o.order[2], 0)
+    test::assert_eq(o.broken.len(), 0)
+end
+
+#[test]
+fn order_breaks_cycles_and_reports_them() is
+    let nodes: [lpath::Node] = [node("a", ["b"], ["a"]), node("b", ["a"], ["b"])]
+    let o: lpath::Order = lpath::order(nodes)
+    test::assert_eq(o.order.len(), 2)
+    test::assert_eq(o.broken.len(), 1)
+end
+
+#[test]
+fn req_name_strips_version() is
+    eq(lpath::req_name("libfoo >= 1.2"), "libfoo")
+    eq(lpath::req_name("libfoo"), "libfoo")
+end
