@@ -1,0 +1,120 @@
+use "std -> test" from "test"
+mod pure
+
+;; Testy czystej logiki lrpm (bez bibliotek bit). Uruchom: h# test src/tests/pure_test.h#
+;; STATUS: napisane w sesji bez kompilatora H# — niezweryfikowane.
+
+#[test]
+fn split_keeps_empty_fields() is
+    let f: [string] = pure::split("a,,b,", ",")
+    test::assert_true(f.len() == 4)
+    test::assert_true(f[1] == "" && f[3] == "")
+end
+
+#[test]
+fn join_and_subst_roundtrip() is
+    test::assert_true(pure::join(["x", "y", "z"], "-") == "x-y-z")
+    test::assert_true(pure::subst("a/b/c", "/", "::") == "a::b::c")
+end
+
+#[test]
+fn awk_placeholders_expand() is
+    let s: string = pure::aw("@L@print @Q@x@Q@@T@@R@")
+    test::assert_true(s.len() == 10)
+    test::assert_true(s[0..1] == __builtin_char_code_to_str(123))
+end
+
+#[test]
+fn url_join_normalizes_slashes() is
+    test::assert_true(pure::url_join("https://h/p/", "/repodata/repomd.xml") == "https://h/p/repodata/repomd.xml")
+    test::assert_true(pure::url_join("https://h/p", "x") == "https://h/p/x")
+end
+
+#[test]
+fn repo_vars_substituted() is
+    test::assert_true(pure::repo_vars("u/$releasever/$basearch", "43", "x86_64") == "u/43/x86_64")
+end
+
+#[test]
+fn evr_matches_libsolv_format() is
+    test::assert_true(pure::evr("0", "2.3.2", "3.fc43") == "2.3.2-3.fc43")
+    test::assert_true(pure::evr("", "2.3.2", "3.fc43") == "2.3.2-3.fc43")
+    test::assert_true(pure::evr("1", "2.3", "1") == "1:2.3-1")
+end
+
+#[test]
+fn split_evr_parts() is
+    let a: [string] = pure::split_evr("1:2.3-4.fc43")
+    test::assert_true(a[0] == "1" && a[1] == "2.3" && a[2] == "4.fc43")
+    let b: [string] = pure::split_evr("258.2-1.fc43")
+    test::assert_true(b[0] == "0" && b[1] == "258.2" && b[2] == "1.fc43")
+end
+
+#[test]
+fn nevra_of_step() is
+    let s: pure::Step = pure::step_from_line("fedora" + pure::tab() + "bash" + pure::tab() + "0" + pure::tab() + "5.2" + pure::tab() + "1.fc43" + pure::tab() + "x86_64" + pure::tab() + "abc" + pure::tab() + "Packages/b/bash.rpm" + pure::tab() + "1234")
+    test::assert_true(pure::nevra(s) == "bash-5.2-1.fc43.x86_64")
+    test::assert_true(s.size == 1234 && s.repo == "fedora" && s.sha256 == "abc")
+end
+
+#[test]
+fn safe_name_blocks_shell_metacharacters() is
+    test::assert_true(pure::safe_name("gcc-c++"))
+    test::assert_true(pure::safe_name("python3.13*"))
+    test::assert_true(!pure::safe_name("a;rm -rf /"))
+    test::assert_true(!pure::safe_name("$(id)"))
+    test::assert_true(!pure::safe_name("-rf"))
+    test::assert_true(!pure::safe_name(""))
+end
+
+#[test]
+fn filesystem_and_setup_are_extracted_first() is
+    let mut xs: [pure::Step] = []
+    let names: [string] = ["bash", "setup", "glibc", "filesystem"]
+    let mut i: int = 0
+    while i < names.len() is
+        let mut s: pure::Step = pure::empty_step()
+        s = pure::Step { name: names[i], epoch: "0", ver: "1", rel: "1", arch: "x86_64", repo: "r", sha256: "", location: "", size: 0 }
+        xs.push(s)
+        i += 1
+    end
+    let o: [pure::Step] = pure::order_steps(xs)
+    test::assert_true(o[0].name == "filesystem" && o[1].name == "setup" && o.len() == 4)
+end
+
+#[test]
+fn stub_detection_and_xml() is
+    test::assert_true(pure::is_stub("legendaryos-compat-systemd"))
+    test::assert_true(!pure::is_stub("systemd"))
+    let x: string = pure::stub_package_xml("systemd", "0", "258", "1.fc43", ["systemd", "systemd-units"])
+    test::assert_true(pure::find(x, "<name>legendaryos-compat-systemd</name>") >= 0)
+    test::assert_true(pure::find(x, "name=" + pure::q() + "systemd-units" + pure::q()) >= 0)
+end
+
+#[test]
+fn sysusers_tokens_handle_quotes() is
+    let t: [string] = pure::sysusers_tokens("u dbus 81 " + pure::q() + "System Message Bus" + pure::q() + " / /usr/sbin/nologin")
+    test::assert_true(t.len() == 6)
+    test::assert_true(t[3] == "System Message Bus" && t[5] == "/usr/sbin/nologin")
+    test::assert_true(pure::sysusers_tokens("# komentarz").len() == 0)
+    test::assert_true(pure::sysusers_tokens("   ").len() == 0)
+end
+
+#[test]
+fn free_system_id_counts_down_from_999() is
+    test::assert_true(pure::free_system_id([]) == 999)
+    test::assert_true(pure::free_system_id([999, 998]) == 997)
+end
+
+#[test]
+fn int_str_and_parse_uint() is
+    test::assert_true(pure::int_str(0) == "0")
+    test::assert_true(pure::int_str(1234) == "1234")
+    test::assert_true(pure::parse_uint("a12b3") == 123)
+end
+
+#[test]
+fn plan_line_split() is
+    let p: [string] = pure::split_plan_line("install foo-1.0-1.x86_64")
+    test::assert_true(p[0] == "install" && p[1] == "foo-1.0-1.x86_64")
+end
