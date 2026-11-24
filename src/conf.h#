@@ -1,0 +1,60 @@
+mod pure
+
+;; Konfiguracja repozytoriów rpm-md (plik .hk):
+;;
+;;   [repos]
+;;   -> fedora
+;;   --> baseurl  => https://dl.fedoraproject.org/pub/fedora/linux/releases/$releasever/Everything/$basearch/os
+;;   --> gpgcheck => true
+;;   --> gpgkey   => https://getfedora.org/static/fedora.gpg
+;;   -> updates
+;;   --> baseurl  => https://dl.fedoraproject.org/pub/fedora/linux/updates/$releasever/Everything/$basearch
+;;   --> enabled  => true
+;;
+;; `$releasever` i `$basearch` są podstawiane. Priorytety repozytoriów: patrz docs/POLICY.md
+;; (przy równym priorytecie solver wybiera najwyższą wersję ze wszystkich repo).
+
+pub struct Repo is
+    pub name:     string
+    pub baseurl:  string
+    pub enabled:  bool
+    pub gpgcheck: bool
+    pub gpgkey:   string
+end
+
+;; Brak pliku / błąd składni → pusta lista (wołający używa `check`).
+pub fn load(path: string, releasever: string, basearch: string) -> [Repo] is
+    let keys: [string] = ft::api::hk_keys(path, "repos")
+    let mut out: [Repo] = []
+    let mut i: int = 0
+    while i < keys.len() is
+        let k: string = keys[i]
+        i += 1
+        if pure::ends_with(k, ".baseurl") is
+            let name: string = k[0..k.len() - 8]
+            let url: string = pure::repo_vars(ft::api::hk_get(path, "repos", k, ""), releasever, basearch)
+            let key: string = pure::repo_vars(ft::api::hk_get(path, "repos", name + ".gpgkey", ""), releasever, basearch)
+            out.push(Repo { name: name, baseurl: url,
+                enabled: ft::api::hk_get_bool(path, "repos", name + ".enabled", true),
+                gpgcheck: ft::api::hk_get_bool(path, "repos", name + ".gpgcheck", true),
+                gpgkey: key })
+        end
+    end
+    return out
+end
+
+;; "" gdy plik poprawny i ma co najmniej jedno włączone repo; inaczej opis problemu.
+pub fn check(path: string, releasever: string, basearch: string) -> string is
+    let e: string = ft::api::hk_check(path)
+    if e != "" is return e end
+    let rs: [Repo] = load(path, releasever, basearch)
+    let mut on: int = 0
+    let mut i: int = 0
+    while i < rs.len() is
+        if rs[i].enabled is on += 1 end
+        if !pure::safe_name(rs[i].name) is return "repos: niepoprawna nazwa repozytorium '" + rs[i].name + "'" end
+        i += 1
+    end
+    if on == 0 is return path + ": brak włączonych repozytoriów w [repos]" end
+    return ""
+end
