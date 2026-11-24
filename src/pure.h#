@@ -1,0 +1,307 @@
+pub struct Step is
+    pub name:     string
+    pub epoch:    string
+    pub ver:      string
+    pub rel:      string
+    pub arch:     string
+    pub repo:     string
+    pub sha256:   string
+    pub location: string
+    pub size:     int
+end
+
+pub fn empty_step() -> Step is
+    return Step { name: "", epoch: "", ver: "", rel: "", arch: "", repo: "", sha256: "", location: "", size: 0 }
+end
+
+pub fn q() -> string is return __builtin_char_code_to_str(34) end
+pub fn tab() -> string is return __builtin_char_code_to_str(9) end
+
+pub fn find(s: string, sub: string) -> int is
+    let n: int = s.len()
+    let m: int = sub.len()
+    if m == 0 is return 0 end
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == sub is return i end
+        i += 1
+    end
+    return 0 - 1
+end
+
+pub fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+pub fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+;; Dzieli po `sep`, zachowując puste pola (potrzebne dla TSV).
+pub fn split(s: string, sep: string) -> [string] is
+    let mut out: [string] = []
+    let m: int = sep.len()
+    let mut start: int = 0
+    let mut i: int = 0
+    while i + m <= s.len() is
+        if s[i..i + m] == sep is
+            out.push(s[start..i])
+            i += m
+            start = i
+        else is
+            i += 1
+        end
+    end
+    out.push(s[start..s.len()])
+    return out
+end
+
+pub fn join(xs: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is out = out + sep end
+        out = out + xs[i]
+        i += 1
+    end
+    return out
+end
+
+pub fn subst(s: string, from: string, to: string) -> string is
+    return join(split(s, from), to)
+end
+
+pub fn basename(p: string) -> string is
+    let parts: [string] = split(p, "/")
+    return parts[parts.len() - 1]
+end
+
+;; Liczba dziesiętna z napisu (znaki spoza 0-9 pomijane); "" → 0.
+pub fn parse_uint(s: string) -> int is
+    let digits: string = "0123456789"
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < s.len() is
+        let d: int = find(digits, s[i..i + 1])
+        if d >= 0 is n = n * 10 + d end
+        i += 1
+    end
+    return n
+end
+
+;; Zamiana znaczników skryptów awk na znaki kłopotliwe w napisach H#
+;; (`{` `}` to interpolacja, `"` utrudnia cytowanie): @L@ { · @R@ } · @Q@ " · @T@ TAB.
+pub fn aw(s: string) -> string is
+    let a: string = subst(s, "@L@", __builtin_char_code_to_str(123))
+    let b: string = subst(a, "@R@", __builtin_char_code_to_str(125))
+    let c: string = subst(b, "@Q@", q())
+    return subst(c, "@T@", tab())
+end
+
+;; ── URL-e i zmienne w konfiguracji repozytoriów ─────────────────────────────
+
+pub fn url_join(base: string, rel: string) -> string is
+    let mut b: string = base
+    while ends_with(b, "/") is b = b[0..b.len() - 1] end
+    let mut r: string = rel
+    while starts_with(r, "/") is r = r[1..r.len()] end
+    return b + "/" + r
+end
+
+;; $releasever / $basearch w baseurl i gpgkey.
+pub fn repo_vars(s: string, releasever: string, basearch: string) -> string is
+    return subst(subst(s, "$releasever", releasever), "$basearch", basearch)
+end
+
+;; Wpis konfiguracji curl (`curl -K`): jeden plik do pobrania.
+pub fn curl_entry(url: string, out: string) -> string is
+    return "url = " + q() + url + q() + "\noutput = " + q() + out + q() + "\n"
+end
+
+;; ── Wersje ──────────────────────────────────────────────────────────────────
+
+;; "ver-rel" (epoch 0/pusty pomijany) albo "epoch:ver-rel" — dokładnie jak `pool_solvable2str` libsolv.
+pub fn evr(epoch: string, ver: string, rel: string) -> string is
+    if epoch == "" || epoch == "0" is return ver + "-" + rel end
+    return epoch + ":" + ver + "-" + rel
+end
+
+pub fn nevra(s: Step) -> string is
+    return s.name + "-" + evr(s.epoch, s.ver, s.rel) + "." + s.arch
+end
+
+;; "epoch:ver-rel" → [epoch, ver, rel] (epoch "0" gdy brak).
+pub fn split_evr(e: string) -> [string] is
+    let mut epoch: string = "0"
+    let mut rest: string = e
+    let c: int = find(e, ":")
+    if c >= 0 is
+        epoch = e[0..c]
+        rest = e[c + 1..e.len()]
+    end
+    let mut k: int = rest.len() - 1
+    while k >= 0 && rest[k..k + 1] != "-" is k -= 1 end
+    if k < 0 is return [epoch, rest, ""] end
+    return [epoch, rest[0..k], rest[k + 1..rest.len()]]
+end
+
+;; ── Nazwy ───────────────────────────────────────────────────────────────────
+
+;; Nazwa pakietu/globa: bez spacji i metaznaków powłoki (ochrona przed wstrzyknięciem).
+pub fn safe_name(s: string) -> bool is
+    let n: int = s.len()
+    if n == 0 || n > 120 || starts_with(s, "-") is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: string = s[i..i + 1]
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "." || c == "_" || c == "+" || c == "-" || c == "*" || c == ":" || c == "@"
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn stub_prefix() -> string is return "legendaryos-compat-" end
+pub fn is_stub(name: string) -> bool is return starts_with(name, stub_prefix()) end
+
+;; Kolejność rozpakowania: `filesystem` (symlinki usrmerge) i `setup` (passwd/group) PIERWSZE —
+;; inaczej pakiet wypakowany wcześniej utworzy /bin jako zwykły katalog.
+pub fn rank(name: string) -> int is
+    if name == "filesystem" is return 0 end
+    if name == "setup" is return 1 end
+    return 2
+end
+
+pub fn order_steps(steps: [Step]) -> [Step] is
+    let mut out: [Step] = []
+    let mut r: int = 0
+    while r < 3 is
+        let mut i: int = 0
+        while i < steps.len() is
+            if rank(steps[i].name) == r is out.push(steps[i]) end
+            i += 1
+        end
+        r += 1
+    end
+    return out
+end
+
+;; ── Linie wyniku solvera i indeksu ──────────────────────────────────────────
+
+;; "install foo-1.0-1.x86_64" → ["install", "foo-1.0-1.x86_64"]
+pub fn split_plan_line(line: string) -> [string] is
+    let i: int = find(line, " ")
+    if i < 0 is return [line, ""] end
+    return [line[0..i], line[i + 1..line.len()]]
+end
+
+;; Linia z wyszukiwania w index.tsv (z prefiksem repo):
+;; repo TAB name TAB epoch TAB ver TAB rel TAB arch TAB sha256 TAB location TAB size
+pub fn step_from_line(line: string) -> Step is
+    let f: [string] = split(line, tab())
+    if f.len() < 9 is return empty_step() end
+    return Step { name: f[1], epoch: f[2], ver: f[3], rel: f[4], arch: f[5], repo: f[0], sha256: f[6],
+        location: f[7], size: parse_uint(f[8]) }
+end
+
+;; ── Atrapy pakietów (compat): minimalny rpm-md z `Provides` ─────────────────
+
+;; Blok <package> udający pakiet `legendaryos-compat-<name>`, który PROVIDES wskazane nazwy
+;; w dokładnie tej wersji (epoch:ver-rel). Ładowany do solvera jak zwykłe repo rpm-md —
+;; nie wymaga struktur `Pkg` z satsolv (omija N2).
+pub fn stub_package_xml(name: string, epoch: string, ver: string, rel: string, provides: [string]) -> string is
+    let qq: string = q()
+    let verattr: string = "epoch=" + qq + epoch + qq + " ver=" + qq + ver + qq + " rel=" + qq + rel + qq
+    let mut s: string = "<package type=" + qq + "rpm" + qq + ">\n  <name>" + stub_prefix() + name + "</name>\n  <arch>noarch</arch>\n"
+    s = s + "  <version " + verattr + "/>\n  <summary>compat stub</summary>\n  <description>compat stub</description>\n"
+    s = s + "  <location href=" + qq + "stub.rpm" + qq + "/>\n  <format>\n    <rpm:provides>\n"
+    let mut i: int = 0
+    while i < provides.len() is
+        s = s + "      <rpm:entry name=" + qq + provides[i] + qq + " flags=" + qq + "EQ" + qq + " " + verattr + "/>\n"
+        i += 1
+    end
+    return s + "    </rpm:provides>\n  </format>\n</package>\n"
+end
+
+pub fn metadata_header(count: int) -> string is
+    let qq: string = q()
+    return "<?xml version=" + qq + "1.0" + qq + " encoding=" + qq + "UTF-8" + qq + "?>\n<metadata xmlns=" + qq + "http://linux.duke.edu/metadata/common" + qq + " xmlns:rpm=" + qq + "http://linux.duke.edu/metadata/rpm" + qq + " packages=" + qq + int_str(count) + qq + ">\n"
+end
+
+pub fn metadata_footer() -> string is return "</metadata>\n" end
+
+pub fn int_str(n: int) -> string is
+    if n == 0 is return "0" end
+    let digits: string = "0123456789"
+    let mut v: int = n
+    let mut out: string = ""
+    while v > 0 is
+        let d: int = v - (v / 10) * 10
+        out = digits[d..d + 1] + out
+        v = v / 10
+    end
+    return out
+end
+
+;; ── sysusers.d: tokenizer linii (z cudzysłowami) ────────────────────────────
+
+;; `u foo - "Foo daemon" /var/lib/foo /sbin/nologin` → ["u","foo","-","Foo daemon","/var/lib/foo","/sbin/nologin"]
+;; Puste linie i komentarze (#) → [].
+pub fn sysusers_tokens(line: string) -> [string] is
+    let t: string = trim(line)
+    let mut out: [string] = []
+    if t == "" || starts_with(t, "#") is return out end
+    let qq: string = q()
+    let mut cur: string = ""
+    let mut inq: bool = false
+    let mut have: bool = false
+    let mut i: int = 0
+    while i < t.len() is
+        let c: string = t[i..i + 1]
+        if inq is
+            if c == qq is inq = false else is cur = cur + c end
+        else is
+            if c == qq is
+                inq = true
+                have = true
+            else is
+                if c == " " || c == tab() is
+                    if have || cur != "" is
+                        out.push(cur)
+                        cur = ""
+                        have = false
+                    end
+                else is
+                    cur = cur + c
+                end
+            end
+        end
+        i += 1
+    end
+    if have || cur != "" is out.push(cur) end
+    return out
+end
+
+pub fn trim(s: string) -> string is
+    let mut a: int = 0
+    let mut b: int = s.len()
+    while a < b && (s[a..a + 1] == " " || s[a..a + 1] == tab() || s[a..a + 1] == "\n" || s[a..a + 1] == "\r") is a += 1 end
+    while b > a && (s[b - 1..b] == " " || s[b - 1..b] == tab() || s[b - 1..b] == "\n" || s[b - 1..b] == "\r") is b -= 1 end
+    return s[a..b]
+end
+
+;; Pierwszy wolny identyfikator systemowy w dół od 999 (jak systemd-sysusers), poza `used`.
+pub fn free_system_id(used: [int]) -> int is
+    let mut id: int = 999
+    while id >= 100 is
+        let mut taken: bool = false
+        let mut i: int = 0
+        while i < used.len() is
+            if used[i] == id is taken = true end
+            i += 1
+        end
+        if !taken is return id end
+        id -= 1
+    end
+    return 0 - 1
+end
