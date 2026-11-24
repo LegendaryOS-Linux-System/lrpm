@@ -1,0 +1,24 @@
+mod pure
+mod meta
+
+;; Rozpakowanie RPM do katalogu. Preferowane `bsdtar` (libarchive czyta RPM natywnie — bez
+;; rpm2cpio/cpio); zapasowo `rpm2cpio | cpio`. Skryptów RPM (%pre/%post…) NIE uruchamiamy —
+;; ich skutki odtwarzają deklaratywne hooki (sysusers.h#, hooks.h#, docs/POLICY.md).
+
+pub fn is_root() -> bool is
+    let r: sys::Exec = ft::sys::exec("id -u")
+    return ft::text::trim(r.out) == "0"
+end
+
+pub fn extract(rpm: string, dest: string) -> string is
+    ft::sys::mkdir_p(dest)
+    if ft::sys::have_tool("bsdtar") is
+        let mut owner: string = " --numeric-owner"
+        if !is_root() is owner = " --no-same-owner" end
+        return meta::run("bsdtar -xpf " + ft::sys::sq(rpm) + " -C " + ft::sys::sq(dest) + owner)
+    end
+    if ft::sys::have_tool("rpm2cpio") && ft::sys::have_tool("cpio") is
+        return meta::run("rpm2cpio " + ft::sys::sq(rpm) + " | cpio -idmu --quiet --no-absolute-filenames -D " + ft::sys::sq(dest))
+    end
+    return "brak `bsdtar` (pakiet bsdtar) ani rpm2cpio+cpio — nie można rozpakować RPM"
+end
