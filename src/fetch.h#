@@ -1,0 +1,111 @@
+use "std -> fs" from "fs"
+mod pure
+mod conf
+mod meta
+
+;; Pobieranie RPM-ów: równoległy curl (-K), weryfikacja sha256 z metadanych repo oraz (gpgcheck)
+;; podpisu GPG przez `rpmkeys --checksig` z własnym katalogiem bazy kluczy (<cache>/rpmdb) —
+;; BEZ dnf i bez dotykania rpmdb systemu. Pliki: <cache>/rpms/<nazwa>.rpm (współdzielone między transakcjami).
+
+pub fn rpm_file(cache: string, s: pure::Step) -> string is
+    return ft::text::path_join(ft::text::path_join(cache, "rpms"), pure::basename(s.location))
+end
+
+fn sha_of(file: string) -> string is
+    let r: sys::Exec = ft::sys::exec("sha256sum " + ft::sys::sq(file))
+    if r.code != 0 is return "" end
+    return pure::split(ft::text::trim(r.out), " ")[0]
+end
+
+fn repo_of(repos: [conf::Repo], name: string) -> conf::Repo is
+    let mut i: int = 0
+    while i < repos.len() is
+        if repos[i].name == name is return repos[i] end
+        i += 1
+    end
+    return conf::Repo { name: "", baseurl: "", enabled: false, gpgcheck: false, gpgkey: "" }
+end
+
+;; Importuje klucze GPG repozytoriów z gpgcheck=true do <cache>/rpmdb. "" albo błąd.
+pub fn import_keys(cache: string, repos: [conf::Repo]) -> string is
+    let mut any: bool = false
+    let mut i: int = 0
+    while i < repos.len() is
+        if repos[i].enabled && repos[i].gpgcheck && repos[i].gpgkey != "" is any = true end
+        i += 1
+    end
+    if !any is return "" end
+    if !ft::sys::have_tool("rpmkeys") is return "gpgcheck=true wymaga `rpmkeys` (pakiet rpm) albo ustaw gpgcheck => false w repos.hk" end
+    let db: string = ft::text::path_join(cache, "rpmdb")
+    let kd: string = ft::text::path_join(cache, "keys")
+    ft::sys::mkdir_p(db)
+    ft::sys::mkdir_p(kd)
+    let mut k: int = 0
+    while k < repos.len() is
+        if repos[k].enabled && repos[k].gpgcheck && repos[k].gpgkey != "" is
+            let urls: [string] = pure::split(pure::subst(repos[k].gpgkey, ",", " "), " ")
+            let mut u: int = 0
+            while u < urls.len() is
+                if urls[u] != "" is
+                    let f: string = ft::text::path_join(kd, repos[k].name + "-" + ft::text::istr(u) + ".gpg")
+                    let mut e: string = meta::run("curl -fsSL --retry 3 -o " + ft::sys::sq(f) + " " + ft::sys::sq(urls[u]))
+                    if e != "" is return "klucz repo " + repos[k].name + ": " + e end
+                    e = meta::run("rpmkeys --dbpath " + ft::sys::sq(db) + " --import " + ft::sys::sq(f))
+                    if e != "" is return e end
+                end
+                u += 1
+            end
+        end
+        k += 1
+    end
+    return ""
+end
+
+;; Pobiera wszystkie brakujące RPM-y z `steps`, weryfikuje sha256 i podpis. "" albo błąd.
+pub fn fetch_all(cache: string, repos: [conf::Repo], steps: [pure::Step]) -> string is
+    let dir: string = ft::text::path_join(cache, "rpms")
+    ft::sys::mkdir_p(dir)
+    let ke: string = import_keys(cache, repos)
+    if ke != "" is return ke end
+    let mut cfg: string = ""
+    let mut todo: int = 0
+    let mut i: int = 0
+    while i < steps.len() is
+        let s: pure::Step = steps[i]
+        i += 1
+        let r: conf::Repo = repo_of(repos, s.repo)
+        if r.name == "" is return "krok " + pure::nevra(s) + ": nieznane repo '" + s.repo + "'" end
+        if s.location == "" is return "krok " + pure::nevra(s) + ": brak location w metadanych" end
+        let f: string = rpm_file(cache, s)
+        if !(fs::exists(f) && sha_of(f) == s.sha256) is
+            cfg = cfg + pure::curl_entry(pure::url_join(r.baseurl, s.location), f)
+            todo += 1
+        end
+    end
+    if todo > 0 is
+        let cf: string = ft::text::path_join(cache, "curl.cfg")
+        if !fs::write(cf, cfg) is return "nie można zapisać " + cf end
+        let e: string = meta::run("curl -fsSL --retry 3 --parallel --parallel-max 8 --create-dirs -K " + ft::sys::sq(cf))
+        ft::sys::rm_f(cf)
+        if e != "" is return e end
+    end
+    let mut j: int = 0
+    while j < steps.len() is
+        let s2: pure::Step = steps[j]
+        j += 1
+        let f2: string = rpm_file(cache, s2)
+        if sha_of(f2) != s2.sha256 is
+            ft::sys::rm_f(f2)
+            return "zła suma sha256: " + pure::nevra(s2)
+        end
+        let r2: conf::Repo = repo_of(repos, s2.repo)
+        if r2.gpgcheck is
+            let c: sys::Exec = ft::sys::exec("rpmkeys --dbpath " + ft::sys::sq(ft::text::path_join(cache, "rpmdb")) + " --checksig " + ft::sys::sq(f2))
+            if c.code != 0 is
+                ft::sys::rm_f(f2)
+                return "podpis GPG nie przeszedł weryfikacji: " + pure::nevra(s2) + " — " + ft::text::trim(c.out)
+            end
+        end
+    end
+    return ""
+end
