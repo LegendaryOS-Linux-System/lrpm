@@ -1,0 +1,28 @@
+[package]
+-> name        => lrpm
+-> version     => 0.1.0
+-> description => Wspólny silnik RPM dla lpm i lepm: rpm-md → satsolv (libsolv) → pobranie/weryfikacja → rozpakowanie. Bez dnf.
+-> authors     => ["LegendaryOS Team"]
+-> license     => GPL-3.0
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[layout]
+-> src => src
+
+[lib]
+-> output => hlib
+
+[commands]
+-> test
+--> run => scripts/run-tests.sh
+--> description => Testy czystej logiki: pure + lpath (bez bibliotek bit — N4)
+
+! libfasttree: tylko jako biblioteka (use "bit -> libfasttree" w src/lib.h#); satsolv: solver zależności.
+[dependencies]
+-> libfasttree => newest
+-> satsolv => newest
+
+! Narzędzia zewnętrzne (nie biblioteki): curl, gawk, bsdtar, zstd|gzip|xz, sha256sum, rpmkeys (tylko gpgcheck=true).
