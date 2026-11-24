@@ -1,0 +1,150 @@
+use "std -> fs" from "fs"
+mod pure
+mod conf
+
+;; Metadane rpm-md: repomd.xml → primary.xml(.zst/.gz/.xz) → sha256 → dekompresja → indeks TSV
+;; (jedno przejście gawk; XML nie jest parsowany w H#).
+;;
+;; Cache:      <cache>/meta/<repo>/{repomd.xml, primary.xml, primary.stamp, index.tsv}
+;; index.tsv:  name TAB epoch TAB ver TAB rel TAB arch TAB sha256 TAB location TAB size
+;;
+;; Zewnętrzne: curl, gawk (RS jako regex), zstd/gzip/xz, sha256sum.
+;; Integralność łańcucha: HTTPS + sha256 z repomd. Podpis repomd.xml.asc: ROADMAP.
+;; Skrypty awk używają znaczników @L@ @R@ @Q@ @T@ (zob. pure::aw).
+
+;; Jeden rekord = jeden <package>…</package>.
+fn index_awk() -> string is
+    return pure::aw("BEGIN@L@RS=@Q@</package>@Q@@R@ @L@ n=@Q@@Q@;ep=@Q@0@Q@;ver=@Q@@Q@;rel=@Q@@Q@;arch=@Q@@Q@;loc=@Q@@Q@;sum=@Q@@Q@;sz=@Q@0@Q@; if(match($0,/<name>[^<]*</)) n=substr($0,RSTART+6,RLENGTH-7); if(n==@Q@@Q@) next; if(match($0,/<arch>[^<]*</)) arch=substr($0,RSTART+6,RLENGTH-7); if(match($0,/<version [^>]*>/))@L@ v=substr($0,RSTART,RLENGTH); if(match(v,/epoch=@Q@[^@Q@]*@Q@/)) ep=substr(v,RSTART+7,RLENGTH-8); if(match(v,/ ver=@Q@[^@Q@]*@Q@/)) ver=substr(v,RSTART+6,RLENGTH-7); if(match(v,/ rel=@Q@[^@Q@]*@Q@/)) rel=substr(v,RSTART+6,RLENGTH-7) @R@ if(match($0,/<checksum type=@Q@sha256@Q@[^>]*>[0-9a-f]+/))@L@ s=substr($0,RSTART,RLENGTH); sub(/^.*>/,@Q@@Q@,s); sum=s @R@ if(match($0,/<location href=@Q@[^@Q@]*@Q@/)) loc=substr($0,RSTART+16,RLENGTH-17); if(match($0,/<size package=@Q@[0-9]+@Q@/)) sz=substr($0,RSTART+15,RLENGTH-16); print n@Q@@T@@Q@ep@Q@@T@@Q@ver@Q@@T@@Q@rel@Q@@T@@Q@arch@Q@@T@@Q@sum@Q@@T@@Q@loc@Q@@T@@Q@sz @R@")
+end
+
+;; repomd.xml → "<sha256> <href>" wpisu `primary`.
+fn repomd_awk() -> string is
+    return pure::aw("/<data type=@Q@primary@Q@>/@L@f=1@R@ f&&/<checksum type=@Q@sha256@Q@>/@L@match($0,/>[0-9a-f]+</);c=substr($0,RSTART+1,RLENGTH-2)@R@ f&&/<location href=/@L@match($0,/href=@Q@[^@Q@]+@Q@/);h=substr($0,RSTART+6,RLENGTH-7)@R@ f&&/<[/]data>/@L@print c@Q@ @Q@h;exit@R@")
+end
+
+pub fn meta_dir(cache: string, repo: string) -> string is
+    return ft::text::path_join(ft::text::path_join(cache, "meta"), repo)
+end
+pub fn primary_xml(cache: string, repo: string) -> string is
+    return ft::text::path_join(meta_dir(cache, repo), "primary.xml")
+end
+pub fn index_tsv(cache: string, repo: string) -> string is
+    return ft::text::path_join(meta_dir(cache, repo), "index.tsv")
+end
+
+;; Wykonuje polecenie; "" albo błąd z końcówką wyjścia.
+pub fn run(cmd: string) -> string is
+    let r: sys::Exec = ft::sys::exec(cmd)
+    if r.code == 0 is return "" end
+    let o: string = ft::text::trim(r.out)
+    let n: int = o.len()
+    let mut tail: string = o
+    if n > 800 is tail = "..." + o[n - 800..n] end
+    return "polecenie zakończone kodem " + ft::text::istr(r.code) + ": " + cmd + "\n" + tail
+end
+
+fn decompress_cmd(file: string) -> string is
+    if pure::ends_with(file, ".zst") is return "zstd -dc " + ft::sys::sq(file) end
+    if pure::ends_with(file, ".gz") is return "gzip -dc " + ft::sys::sq(file) end
+    if pure::ends_with(file, ".xz") is return "xz -dc " + ft::sys::sq(file) end
+    if pure::ends_with(file, ".bz2") is return "bzip2 -dc " + ft::sys::sq(file) end
+    return "cat " + ft::sys::sq(file)
+end
+
+;; index.tsv z primary.xml albo z pliku z blokami <package>.
+pub fn build_index(xml: string, out: string) -> string is
+    return run("gawk " + ft::sys::sq(index_awk()) + " " + ft::sys::sq(xml) + " > " + ft::sys::sq(out))
+end
+
+;; Synchronizacja jednego repo; pomija primary, gdy sha256 z repomd się nie zmienił.
+pub fn sync(cache: string, r: conf::Repo) -> string is
+    let d: string = meta_dir(cache, r.name)
+    ft::sys::mkdir_p(d)
+    let md: string = ft::text::path_join(d, "repomd.xml")
+    let mut e: string = run("curl -fsSL --retry 3 -o " + ft::sys::sq(md) + " " + ft::sys::sq(pure::url_join(r.baseurl, "repodata/repomd.xml")))
+    if e != "" is return "repo " + r.name + ": " + e end
+    let x: sys::Exec = ft::sys::exec("gawk " + ft::sys::sq(repomd_awk()) + " " + ft::sys::sq(md))
+    let parts: [string] = pure::split(ft::text::trim(x.out), " ")
+    if x.code != 0 || parts.len() != 2 || parts[0] == "" || parts[1] == "" is
+        return "repo " + r.name + ": nie znaleziono wpisu primary w repomd.xml"
+    end
+    let sha: string = parts[0]
+    let href: string = parts[1]
+    let stamp: string = ft::text::path_join(d, "primary.stamp")
+    if fs::exists(stamp) && fs::exists(primary_xml(cache, r.name)) && fs::exists(index_tsv(cache, r.name)) is
+        if ft::text::trim(fs::read(stamp)) == sha is return "" end
+    end
+    let dl: string = ft::text::path_join(d, "primary.download")
+    e = run("curl -fsSL --retry 3 -o " + ft::sys::sq(dl) + " " + ft::sys::sq(pure::url_join(r.baseurl, href)))
+    if e != "" is return "repo " + r.name + ": " + e end
+    let got: sys::Exec = ft::sys::exec("sha256sum " + ft::sys::sq(dl))
+    let g: [string] = pure::split(ft::text::trim(got.out), " ")
+    if got.code != 0 || g[0] != sha is
+        ft::sys::rm_f(dl)
+        return "repo " + r.name + ": zła suma sha256 primary (oczekiwano " + sha + ")"
+    end
+    let named: string = ft::text::path_join(d, "primary." + pure::basename(href))
+    e = run("mv -f " + ft::sys::sq(dl) + " " + ft::sys::sq(named))
+    if e != "" is return e end
+    let tmpx: string = ft::text::path_join(d, "primary.xml.tmp")
+    e = run(decompress_cmd(named) + " > " + ft::sys::sq(tmpx))
+    if e != "" is return "repo " + r.name + ": " + e end
+    e = run("mv -f " + ft::sys::sq(tmpx) + " " + ft::sys::sq(primary_xml(cache, r.name)))
+    if e != "" is return e end
+    ft::sys::rm_f(named)
+    e = build_index(primary_xml(cache, r.name), index_tsv(cache, r.name))
+    if e != "" is return e end
+    if !fs::write(stamp, sha) is return "nie można zapisać " + stamp end
+    return ""
+end
+
+pub fn sync_all(cache: string, repos: [conf::Repo]) -> string is
+    let mut i: int = 0
+    while i < repos.len() is
+        if repos[i].enabled is
+            let e: string = sync(cache, repos[i])
+            if e != "" is return e end
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; Najwyższa wersja "ver-rel" pakietu `name` we wszystkich indeksach (sort -V). "" gdy brak.
+pub fn latest_version(cache: string, repos: [conf::Repo], name: string) -> string is
+    if !pure::safe_name(name) is return "" end
+    let prog: string = pure::aw("$1==@Q@") + name + pure::aw("@Q@@L@print ($2==@Q@0@Q@?@Q@@Q@:$2@Q@:@Q@)$3@Q@-@Q@$4@R@")
+    let mut all: string = ""
+    let mut i: int = 0
+    while i < repos.len() is
+        if repos[i].enabled && fs::exists(index_tsv(cache, repos[i].name)) is
+            let r: sys::Exec = ft::sys::exec("gawk -F " + ft::sys::sq(pure::tab()) + " " + ft::sys::sq(prog) + " " + ft::sys::sq(index_tsv(cache, repos[i].name)))
+            all = all + r.out
+        end
+        i += 1
+    end
+    if ft::text::trim(all) == "" is return "" end
+    let s: sys::Exec = ft::sys::exec("printf %s " + ft::sys::sq(all) + " | sort -V | tail -1")
+    return ft::text::trim(s.out)
+end
+
+;; Wyszukiwanie po podciągu nazwy (bez rozróżniania wielkości liter): "repo name ver-rel arch".
+pub fn search(cache: string, repos: [conf::Repo], term: string) -> [string] is
+    let mut out: [string] = []
+    if !pure::safe_name(term) is return out end
+    let prog: string = pure::aw("index(tolower($1),tolower(t))@L@print r@Q@ @Q@$1@Q@ @Q@($2==@Q@0@Q@?@Q@@Q@:$2@Q@:@Q@)$3@Q@-@Q@$4@Q@ @Q@$5@R@")
+    let mut i: int = 0
+    while i < repos.len() is
+        if repos[i].enabled && fs::exists(index_tsv(cache, repos[i].name)) is
+            let r: sys::Exec = ft::sys::exec("gawk -F " + ft::sys::sq(pure::tab()) + " -v t=" + ft::sys::sq(term) + " -v r=" + ft::sys::sq(repos[i].name) + " " + ft::sys::sq(prog) + " " + ft::sys::sq(index_tsv(cache, repos[i].name)) + " | sort -u | head -200")
+            let ls: [string] = ft::text::lines(r.out)
+            let mut k: int = 0
+            while k < ls.len() is
+                if ls[k] != "" is out.push(ls[k]) end
+                k += 1
+            end
+        end
+        i += 1
+    end
+    return out
+end
