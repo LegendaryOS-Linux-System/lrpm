@@ -1,0 +1,164 @@
+use "std -> fs" from "fs"
+mod pure
+
+;; Minimalna implementacja sysusers.d (zamiast `systemd-sysusers`, którego pakiet jest wykluczony):
+;;   u NAZWA ID|-|UID:GID "opis" [HOME [SHELL]]   · g NAZWA GID|-   · m UŻYTKOWNIK GRUPA
+;; Źródła: <root>/usr/lib/sysusers.d/*.conf (i etc/sysusers.d). Idempotentne: istniejące wpisy pomijane.
+;; Zapisuje etc/passwd, etc/group, etc/shadow, etc/gshadow. Nieobsługiwane typy (r, …) są pomijane.
+;; Użycie: lepm (rootfs przed zamianą układu: root=<rootfs>), lpm na starcie systemu (root="/").
+
+fn read_or_empty(p: string) -> string is
+    if fs::exists(p) is return fs::read(p) end
+    return ""
+end
+
+;; Zajęte identyfikatory (3. pole passwd i group).
+fn used_ids(passwd: string, group: string) -> [int] is
+    let mut ids: [int] = []
+    let ls: [string] = ft::text::lines(passwd + group)
+    let mut i: int = 0
+    while i < ls.len() is
+        let f: [string] = pure::split(ls[i], ":")
+        if f.len() > 2 is ids.push(pure::parse_uint(f[2])) end
+        i += 1
+    end
+    return ids
+end
+
+fn has_name(db: string, name: string) -> bool is
+    let ls: [string] = ft::text::lines(db)
+    let mut i: int = 0
+    while i < ls.len() is
+        if pure::starts_with(ls[i], name + ":") is return true end
+        i += 1
+    end
+    return false
+end
+
+fn id_of(db: string, name: string) -> int is
+    let ls: [string] = ft::text::lines(db)
+    let mut i: int = 0
+    while i < ls.len() is
+        if pure::starts_with(ls[i], name + ":") is return pure::parse_uint(pure::split(ls[i], ":")[2]) end
+        i += 1
+    end
+    return 0 - 1
+end
+
+fn conf_files(root: string) -> [string] is
+    let mut out: [string] = []
+    let dirs: [string] = [ft::text::path_join(root, "usr/lib/sysusers.d"), ft::text::path_join(root, "etc/sysusers.d")]
+    let mut d: int = 0
+    while d < dirs.len() is
+        if fs::is_dir(dirs[d]) is
+            let fs_: [string] = fs::list_dir(dirs[d])
+            let mut i: int = 0
+            while i < fs_.len() is
+                if pure::ends_with(fs_[i], ".conf") is out.push(ft::text::path_join(dirs[d], fs_[i])) end
+                i += 1
+            end
+        end
+        d += 1
+    end
+    return out
+end
+
+;; Stosuje wszystkie sysusers.d w <root>. Zwraca "" albo błąd; `created` ≈ liczba nowych kont/grup w logu stdout nie jest drukowana.
+pub fn apply(root: string) -> string is
+    let etc: string = ft::text::path_join(root, "etc")
+    ft::sys::mkdir_p(etc)
+    let pp: string = ft::text::path_join(etc, "passwd")
+    let gp: string = ft::text::path_join(etc, "group")
+    let sp: string = ft::text::path_join(etc, "shadow")
+    let gsp: string = ft::text::path_join(etc, "gshadow")
+    let mut passwd: string = read_or_empty(pp)
+    let mut group: string = read_or_empty(gp)
+    let mut shadow: string = read_or_empty(sp)
+    let mut gshadow: string = read_or_empty(gsp)
+    let files: [string] = conf_files(root)
+    let mut f: int = 0
+    while f < files.len() is
+        let ls: [string] = ft::text::lines(fs::read(files[f]))
+        f += 1
+        let mut i: int = 0
+        while i < ls.len() is
+            let t: [string] = pure::sysusers_tokens(ls[i])
+            i += 1
+            if t.len() >= 2 is
+                let kind: string = t[0]
+                let name: string = t[1]
+                if !pure::safe_name(name) is return "sysusers: niepoprawna nazwa '" + name + "' w " + files[f - 1] end
+                if kind == "g" is
+                    if !has_name(group, name) is
+                        let mut gid: int = 0 - 1
+                        if t.len() > 2 && t[2] != "-" is gid = pure::parse_uint(t[2]) end
+                        if gid < 0 is gid = pure::free_system_id(used_ids(passwd, group)) end
+                        group = group + name + ":x:" + pure::int_str(gid) + ":\n"
+                        gshadow = gshadow + name + ":!::\n"
+                    end
+                end
+                if kind == "u" is
+                    if !has_name(passwd, name) is
+                        let mut uid: int = 0 - 1
+                        let mut gid2: int = 0 - 1
+                        if t.len() > 2 && t[2] != "-" is
+                            let ug: [string] = pure::split(t[2], ":")
+                            uid = pure::parse_uint(ug[0])
+                            if ug.len() > 1 is gid2 = pure::parse_uint(ug[1]) end
+                        end
+                        if uid < 0 is uid = pure::free_system_id(used_ids(passwd, group)) end
+                        if has_name(group, name) is gid2 = id_of(group, name) end
+                        if gid2 < 0 is gid2 = uid end
+                        if !has_name(group, name) is
+                            group = group + name + ":x:" + pure::int_str(gid2) + ":\n"
+                            gshadow = gshadow + name + ":!::\n"
+                        end
+                        let mut gecos: string = ""
+                        if t.len() > 3 && t[3] != "-" is gecos = t[3] end
+                        let mut home: string = "/"
+                        if t.len() > 4 && t[4] != "-" is home = t[4] end
+                        let mut shell: string = "/usr/sbin/nologin"
+                        if t.len() > 5 && t[5] != "-" is shell = t[5] end
+                        passwd = passwd + name + ":x:" + pure::int_str(uid) + ":" + pure::int_str(gid2) + ":" + gecos + ":" + home + ":" + shell + "\n"
+                        shadow = shadow + name + ":!*:19000::::::\n"
+                    end
+                end
+                if kind == "m" && t.len() > 2 is
+                    let ls2: [string] = ft::text::lines(group)
+                    let mut ng: [string] = []
+                    let mut g: int = 0
+                    while g < ls2.len() is
+                        let row: string = ls2[g]
+                        g += 1
+                        if pure::starts_with(row, t[2] + ":") is
+                            let mut c: [string] = pure::split(row, ":")
+                            if c.len() == 4 is
+                                let mem: [string] = pure::split(c[3], ",")
+                                let mut have: bool = false
+                                let mut m: int = 0
+                                while m < mem.len() is
+                                    if mem[m] == name is have = true end
+                                    m += 1
+                                end
+                                if !have is
+                                    if c[3] == "" is c[3] = name else is c[3] = c[3] + "," + name end
+                                end
+                                ng.push(pure::join(c, ":"))
+                            else is
+                                ng.push(row)
+                            end
+                        else is
+                            if row != "" is ng.push(row) end
+                        end
+                    end
+                    group = pure::join(ng, "\n") + "\n"
+                end
+            end
+        end
+    end
+    if !fs::write(pp, passwd) is return "nie można zapisać " + pp end
+    if !fs::write(gp, group) is return "nie można zapisać " + gp end
+    if !fs::write(sp, shadow) is return "nie można zapisać " + sp end
+    if !fs::write(gsp, gshadow) is return "nie można zapisać " + gsp end
+    return ""
+end
