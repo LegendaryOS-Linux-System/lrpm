@@ -1,0 +1,29 @@
+mod pure
+mod meta
+
+;; Hooki po rozpakowaniu — deklaratywny zamiennik skryptletów RPM (lista `[hooks] run` w compat.hk).
+;; root = katalog obrazu (chroot z zamontowanymi /proc /dev) albo "/" (żywy system — bez chroot).
+;; Polecenie jest uruchamiane tylko wtedy, gdy jego program istnieje w obrazie; porażka = ostrzeżenie.
+;; Zwraca listę ostrzeżeń (pusta = wszystko OK).
+
+fn in_root(root: string, cmd: string) -> string is
+    if root == "/" || root == "" is return "/bin/sh -c " + ft::sys::sq(cmd) end
+    let r: string = ft::sys::sq(root)
+    return "mount -t proc proc " + r + "/proc 2>/dev/null; mount --rbind /dev " + r + "/dev 2>/dev/null; chroot " + r + " /bin/sh -c " + ft::sys::sq(cmd) + "; rc=$?; umount -R " + r + "/dev 2>/dev/null; umount " + r + "/proc 2>/dev/null; exit $rc"
+end
+
+pub fn run(root: string, cmds: [string]) -> [string] is
+    let mut warn: [string] = []
+    let mut i: int = 0
+    while i < cmds.len() is
+        let c: string = cmds[i]
+        i += 1
+        let prog: string = pure::split(c, " ")[0]
+        let probe: sys::Exec = ft::sys::exec(in_root(root, "command -v " + prog))
+        if probe.code == 0 is
+            let r: sys::Exec = ft::sys::exec(in_root(root, c))
+            if r.code != 0 is warn.push("hook '" + c + "' zakończony kodem " + ft::text::istr(r.code) + ": " + ft::text::trim(r.out)) end
+        end
+    end
+    return warn
+end
