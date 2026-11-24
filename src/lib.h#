@@ -1,0 +1,25 @@
+use "bit -> libfasttree" from "ft"
+use "bit -> satsolv" from "sv"
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  lrpm — wspólny silnik RPM dla lpm (na urządzeniu) i lepm (przy budowie obrazu).
+;;
+;;  Zamiast dnf: metadane rpm-md → satsolv (libsolv) → pobranie + weryfikacja →
+;;  rozpakowanie (bsdtar) → hooki. Zero kopii libfasttree/satsolv: oba importy są TUTAJ,
+;;  w pliku wejściowym biblioteki (H# 0.9: importy bit tylko w pliku wejściowym — N3).
+;;  Zob. docs/ARCHITECTURE.md i docs/POLICY.md.
+;;
+;;  Kolejność `mod` = kolejność łączenia: najpierw moduły bez zależności.
+;; ═══════════════════════════════════════════════════════════════════════════
+mod pure
+mod lpath
+mod conf
+mod policy
+mod meta
+mod instdb
+mod solve
+mod fetch
+mod extract
+mod sysusers
+mod hooks
+mod txn
