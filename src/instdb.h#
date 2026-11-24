@@ -1,0 +1,74 @@
+use "std -> fs" from "fs"
+mod pure
+mod meta
+
+;; Baza zainstalowanych pakietów = dokument rpm-md (`installed.xml`) złożony z bloków <package>
+;; skopiowanych z primary.xml repozytoriów. Dzięki temu solver (libsolv) zna pełne Provides/Requires
+;; zainstalowanych pakietów i liczy zależności WZGLĘDEM bazy systemu, nie od zera.
+;;
+;;   obraz:   /system/share/legendaryos/installed.xml   (zapisuje lepm przy budowie, lpm przy warstwach)
+;;
+;; Bloki wybieramy gawk-iem po kluczu "name TAB ver TAB rel TAB arch" (tryb keep) albo usuwamy po nazwie (tryb drop).
+
+fn blocks_awk() -> string is
+    return pure::aw("BEGIN@L@while((getline l<wants)>0) w[l]=1; close(wants); RS=@Q@</package>@Q@@R@ @L@ n=@Q@@Q@;ver=@Q@@Q@;rel=@Q@@Q@;arch=@Q@@Q@; if(match($0,/<name>[^<]*</)) n=substr($0,RSTART+6,RLENGTH-7); if(n==@Q@@Q@) next; if(match($0,/<arch>[^<]*</)) arch=substr($0,RSTART+6,RLENGTH-7); if(match($0,/<version [^>]*>/))@L@ v=substr($0,RSTART,RLENGTH); if(match(v,/ ver=@Q@[^@Q@]*@Q@/)) ver=substr(v,RSTART+6,RLENGTH-7); if(match(v,/ rel=@Q@[^@Q@]*@Q@/)) rel=substr(v,RSTART+6,RLENGTH-7) @R@ i=index($0,@Q@<package @Q@); if(i>0) $0=substr($0,i); key=n@Q@@T@@Q@ver@Q@@T@@Q@rel@Q@@T@@Q@arch; if(mode==@Q@keep@Q@)@L@ if(key in w) print $0 @Q@</package>@Q@ @R@ else@L@ if(!(n in w)) print $0 @Q@</package>@Q@ @R@ @R@")
+end
+
+;; Zapisuje dokument installed.xml: nagłówek + bloki z pliku `blocks` + stopka.
+pub fn wrap(blocks: string, count: int, out: string) -> string is
+    let head: string = pure::metadata_header(count)
+    let body: string = ""
+    if !fs::write(out, head) is return "nie można zapisać " + out end
+    let mut e: string = ""
+    if fs::exists(blocks) is
+        e = meta::run("cat " + ft::sys::sq(blocks) + " >> " + ft::sys::sq(out))
+        if e != "" is return e end
+    end
+    return meta::run("printf %s " + ft::sys::sq(pure::metadata_footer()) + " >> " + ft::sys::sq(out))
+end
+
+;; Bloki wskazanych pakietów (wants: linie "name TAB ver TAB rel TAB arch") z primary.xml → dopisane do `out`.
+pub fn extract_blocks(primary: string, wants: string, out: string) -> string is
+    return meta::run("gawk -v mode=keep -v wants=" + ft::sys::sq(wants) + " " + ft::sys::sq(blocks_awk()) + " " + ft::sys::sq(primary) + " >> " + ft::sys::sq(out))
+end
+
+;; Zawartość installed.xml bez bloków pakietów o podanych nazwach → `out` (zwykły dokument).
+pub fn remove_names(xml: string, names: [string], out: string) -> string is
+    let wf: string = out + ".names"
+    if !fs::write(wf, pure::join(names, "\n") + "\n") is return "nie można zapisać " + wf end
+    let tmp: string = out + ".blocks"
+    let e: string = meta::run("gawk -v mode=drop -v wants=" + ft::sys::sq(wf) + " " + ft::sys::sq(blocks_awk()) + " " + ft::sys::sq(xml) + " > " + ft::sys::sq(tmp))
+    if e != "" is return e end
+    let c: sys::Exec = ft::sys::exec("grep -c '</package>' " + ft::sys::sq(tmp))
+    let r: string = wrap(tmp, pure::parse_uint(ft::text::trim(c.out)), out)
+    ft::sys::rm_f(wf)
+    ft::sys::rm_f(tmp)
+    return r
+end
+
+;; installed.xml + nowe bloki → nowy installed.xml (`out`).
+pub fn merge(old_xml: string, new_blocks: string, out: string) -> string is
+    let tmp: string = out + ".all"
+    let mut e: string = ""
+    if fs::exists(old_xml) is
+        e = meta::run("gawk -v mode=drop -v wants=/dev/null " + ft::sys::sq(blocks_awk()) + " " + ft::sys::sq(old_xml) + " > " + ft::sys::sq(tmp))
+    else is
+        e = meta::run(": > " + ft::sys::sq(tmp))
+    end
+    if e != "" is return e end
+    if fs::exists(new_blocks) is
+        e = meta::run("cat " + ft::sys::sq(new_blocks) + " >> " + ft::sys::sq(tmp))
+        if e != "" is return e end
+    end
+    let c: sys::Exec = ft::sys::exec("grep -c '</package>' " + ft::sys::sq(tmp))
+    let r: string = wrap(tmp, pure::parse_uint(ft::text::trim(c.out)), out)
+    ft::sys::rm_f(tmp)
+    return r
+end
+
+;; Nazwy zainstalowanych pakietów (do raportów).
+pub fn names(xml: string) -> [string] is
+    if !fs::exists(xml) is return [] end
+    let r: sys::Exec = ft::sys::exec("grep -o '<name>[^<]*</name>' " + ft::sys::sq(xml) + " | sed 's/<[^>]*>//g' | sort -u")
+    return ft::text::lines(r.out)
+end
