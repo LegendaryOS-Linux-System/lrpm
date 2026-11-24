@@ -1,0 +1,242 @@
+use "std -> fs" from "fs"
+mod pure
+mod conf
+mod policy
+mod meta
+mod instdb
+mod solve
+mod fetch
+mod extract
+mod sysusers
+mod hooks
+
+;; Transakcje na wysokim poziomie — to jest API, którego używają lpm i lepm:
+;;
+;;   prepare()      sync metadanych → solver (satsolv) → pobranie i weryfikacja RPM → bloki dla installed.xml
+;;   install_into() rozpakowanie kroków do katalogu + sysusers + hooki + installed.xml   (lepm: bootstrap rootfs)
+;;
+;; lpm po `prepare()` rozpakowuje sam (mapowanie /usr→/system, warstwy FastTree), dlatego te dwa etapy są rozdzielone.
+
+pub struct Request is
+    pub cache:         string   ;; katalog cache (metadane, RPM-y, klucze)
+    pub repos_file:    string   ;; repos.hk
+    pub policy_file:   string   ;; compat.hk ("" = brak polityki)
+    pub releasever:    string
+    pub arch:          string
+    pub installed_xml: string   ;; "" = nic nie zainstalowane (budowa obrazu)
+    pub want:          [string]
+    pub erase:         [string]
+end
+
+pub struct Prepared is
+    pub ok:       bool
+    pub error:    string
+    pub problems: [string]
+    pub steps:    [pure::Step]
+    pub files:    [string]      ;; ścieżki RPM równolegle do steps (puste przy download=false)
+    pub blocks:   string        ;; plik z blokami <package> nowych pakietów (do instdb::merge)
+end
+
+fn pfail(msg: string) -> Prepared is
+    return Prepared { ok: false, error: msg, problems: [], steps: [], files: [], blocks: "" }
+end
+
+;; Samo odświeżenie metadanych (lpm sync).
+pub fn sync(r: Request) -> string is
+    let repos: [conf::Repo] = conf::load(r.repos_file, r.releasever, r.arch)
+    let ce: string = conf::check(r.repos_file, r.releasever, r.arch)
+    if ce != "" is return ce end
+    return meta::sync_all(r.cache, repos)
+end
+
+pub fn search(r: Request, term: string) -> [string] is
+    return meta::search(r.cache, conf::load(r.repos_file, r.releasever, r.arch), term)
+end
+
+;; Cały etap planowania. `download` = false → tylko plan (dry-run).
+pub fn prepare(r: Request, download: bool) -> Prepared is
+    let ce: string = conf::check(r.repos_file, r.releasever, r.arch)
+    if ce != "" is return pfail(ce) end
+    let repos: [conf::Repo] = conf::load(r.repos_file, r.releasever, r.arch)
+    let pol: policy::Policy = policy::load(r.policy_file)
+    let pv: [string] = policy::validate(pol)
+    if pv.len() > 0 is return pfail("compat.hk: " + pv[0]) end
+    let se: string = meta::sync_all(r.cache, repos)
+    if se != "" is return pfail(se) end
+    let sol: solve::Solution = solve::resolve(r.cache, repos, pol, r.arch, r.installed_xml, r.want, r.erase)
+    if !sol.ok is
+        return Prepared { ok: false, error: sol.error, problems: sol.problems, steps: [], files: [], blocks: "" }
+    end
+    if sol.steps.len() == 0 is
+        return Prepared { ok: true, error: "", problems: [], steps: [], files: [], blocks: "" }
+    end
+    let mut files: [string] = []
+    if download is
+        let fe: string = fetch::fetch_all(r.cache, repos, sol.steps)
+        if fe != "" is return pfail(fe) end
+        let mut i: int = 0
+        while i < sol.steps.len() is
+            files.push(fetch::rpm_file(r.cache, sol.steps[i]))
+            i += 1
+        end
+    end
+    ;; bloki <package> nowych pakietów (klucz: name TAB ver TAB rel TAB arch), osobno dla każdego repo
+    let blocks: string = ft::text::path_join(r.cache, "txn-" + ft::text::istr(ft::sys::pid()) + ".blocks")
+    ft::sys::rm_f(blocks)
+    let mut k: int = 0
+    while k < repos.len() is
+        let mut wants: string = ""
+        let mut j: int = 0
+        while j < sol.steps.len() is
+            let s: pure::Step = sol.steps[j]
+            if s.repo == repos[k].name is
+                wants = wants + s.name + pure::tab() + s.ver + pure::tab() + s.rel + pure::tab() + s.arch + "\n"
+            end
+            j += 1
+        end
+        if wants != "" is
+            let wf: string = blocks + ".wants"
+            if !fs::write(wf, wants) is return pfail("nie można zapisać " + wf) end
+            let be: string = instdb::extract_blocks(meta::primary_xml(r.cache, repos[k].name), wf, blocks)
+            ft::sys::rm_f(wf)
+            if be != "" is return pfail(be) end
+        end
+        k += 1
+    end
+    return Prepared { ok: true, error: "", problems: [], steps: sol.steps, files: files, blocks: blocks }
+end
+
+pub struct Installed is
+    pub error:    string
+    pub warnings: [string]
+end
+
+;; lepm: rozpakowuje kroki do `root` (filesystem i setup pierwsze), stosuje sysusers i hooki z polityki,
+;; zapisuje <root>/usr/share/legendaryos/installed.xml (baza dla przyszłych `lpm install`).
+pub fn install_into(root: string, p: Prepared, r: Request) -> Installed is
+    let mut warn: [string] = []
+    let mut i: int = 0
+    while i < p.steps.len() is
+        let e: string = extract::extract(p.files[i], root)
+        if e != "" is return Installed { error: pure::nevra(p.steps[i]) + ": " + e, warnings: warn } end
+        i += 1
+    end
+    let ue: string = sysusers::apply(root)
+    if ue != "" is return Installed { error: ue, warnings: warn } end
+    let pol: policy::Policy = policy::load(r.policy_file)
+    let hw: [string] = hooks::run(root, pol.hooks)
+    let mut h: int = 0
+    while h < hw.len() is
+        warn.push(hw[h])
+        h += 1
+    end
+    let dir: string = ft::text::path_join(root, "usr/share/legendaryos")
+    ft::sys::mkdir_p(dir)
+    let me: string = instdb::merge("", p.blocks, ft::text::path_join(dir, "installed.xml"))
+    if me != "" is return Installed { error: me, warnings: warn } end
+    return Installed { error: "", warnings: warn }
+end
+
+;; ═══ Fasada z typami prostymi (dla lpm/lepm — omija N2: nie trzeba tworzyć ani czytać struktur lrpm) ═══
+
+fn mkreq(cache: string, repos_file: string, policy_file: string, releasever: string, arch: string,
+         installed_xml: string, want: [string], erase: [string]) -> Request is
+    return Request { cache: cache, repos_file: repos_file, policy_file: policy_file, releasever: releasever,
+        arch: arch, installed_xml: installed_xml, want: want, erase: erase }
+end
+
+;; Planowanie (+ opcjonalnie pobranie) jako wiersze TSV:
+;;   E TAB błąd                         — niepowodzenie (pierwszy wiersz)
+;;   P TAB opis problemu solvera        — zero lub więcej
+;;   S TAB nazwa TAB nevra TAB plik TAB repo TAB ver-rel TAB arch TAB sha256 TAB rozmiar
+;;   B TAB ścieżka pliku z blokami <package> (wejście dla instdb::merge)
+pub fn flat_prepare(cache: string, repos_file: string, policy_file: string, releasever: string, arch: string,
+                    installed_xml: string, want: [string], download: bool) -> [string] is
+    let p: Prepared = prepare(mkreq(cache, repos_file, policy_file, releasever, arch, installed_xml, want, []), download)
+    let t: string = pure::tab()
+    let mut out: [string] = []
+    if !p.ok is
+        out.push("E" + t + p.error)
+        let mut i: int = 0
+        while i < p.problems.len() is
+            out.push("P" + t + p.problems[i])
+            i += 1
+        end
+        return out
+    end
+    let mut k: int = 0
+    while k < p.steps.len() is
+        let s: pure::Step = p.steps[k]
+        let mut f: string = ""
+        if k < p.files.len() is f = p.files[k] end
+        out.push("S" + t + s.name + t + pure::nevra(s) + t + f + t + s.repo + t + pure::evr(s.epoch, s.ver, s.rel) + t + s.arch + t + s.sha256 + t + pure::int_str(s.size))
+        k += 1
+    end
+    if p.blocks != "" is out.push("B" + t + p.blocks) end
+    return out
+end
+
+;; Budowa rootfs od zera (lepm). Wynik: [błąd, wiersze raportu…]; błąd "" = sukces.
+;; Raport: "+ nevra" dla każdego pakietu, "! ostrzeżenie" dla hooków.
+pub fn bootstrap(root: string, cache: string, repos_file: string, policy_file: string, releasever: string,
+                 arch: string, want: [string], dry: bool) -> [string] is
+    let rq: Request = mkreq(cache, repos_file, policy_file, releasever, arch, "", want, [])
+    let p: Prepared = prepare(rq, !dry)
+    if !p.ok is
+        let mut e: [string] = [p.error]
+        let mut i: int = 0
+        while i < p.problems.len() is
+            e.push("  problem: " + p.problems[i])
+            i += 1
+        end
+        return e
+    end
+    let mut out: [string] = [""]
+    let mut k: int = 0
+    while k < p.steps.len() is
+        out.push("+ " + pure::nevra(p.steps[k]))
+        k += 1
+    end
+    if dry is return out end
+    let ins: Installed = install_into(root, p, rq)
+    if ins.error != "" is
+        let mut e2: [string] = [ins.error]
+        return e2
+    end
+    let mut w: int = 0
+    while w < ins.warnings.len() is
+        out.push("! " + ins.warnings[w])
+        w += 1
+    end
+    return out
+end
+
+;; ── drobne funkcje pomocnicze dla CLI (żeby lepm nie importował libfasttree) ──
+
+pub fn tool_present(name: string) -> bool is return ft::sys::have_tool(name) end
+pub fn istr(n: int) -> string is return pure::int_str(n) end
+pub fn eprint(msg: string) is ft::sys::eprint(msg) end
+
+pub fn sync_flat(cache: string, repos_file: string, releasever: string, arch: string) -> string is
+    return sync(mkreq(cache, repos_file, "", releasever, arch, "", [], []))
+end
+
+pub fn search_flat(cache: string, repos_file: string, releasever: string, arch: string, term: string) -> [string] is
+    return search(mkreq(cache, repos_file, "", releasever, arch, "", [], []), term)
+end
+
+;; Wyzwalacze po zmianie wdrożenia (lpm triggers / start systemu): sysusers + hooki z compat.hk, na żywym
+;; systemie (root="/") albo w katalogu testowym. Wynik: [błąd, ostrzeżenia…]; błąd "" = OK.
+pub fn run_triggers(root: string, policy_file: string) -> [string] is
+    let e: string = sysusers::apply(root)
+    if e != "" is return [e] end
+    let pol: policy::Policy = policy::load(policy_file)
+    let w: [string] = hooks::run(root, pol.hooks)
+    let mut out: [string] = [""]
+    let mut i: int = 0
+    while i < w.len() is
+        out.push(w[i])
+        i += 1
+    end
+    return out
+end
