@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Test integracyjny solvera (satsolv/libsolv) na sztucznym repo rpm-md (file://). Wymaga: lepm (LEPM=...), python3, gawk, curl.
+#   LEPM=/ścieżka/do/lepm bash scripts/solver-e2e.sh
+set -euo pipefail
+LEPM="${LEPM:-lepm}"
+W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
+cd "$W"
+python3 - "$W" <<'PY'
+import gzip,hashlib,os,re,sys
+w=sys.argv[1]
+os.makedirs(w+'/repo/repodata',exist_ok=True)
+def ent(l):
+    o=''
+    for e in l:
+        m=re.match(r'^([^<>=]+?)\s*(>=|<=|=|<|>)\s*(\S+)$',e)
+        if m: o+='<rpm:entry name="%s" flags="%s" epoch="0" ver="%s"/>'%(m.group(1),{'>=':'GE','<=':'LE','=':'EQ','<':'LT','>':'GT'}[m.group(2)],m.group(3))
+        else: o+='<rpm:entry name="%s"/>'%e
+    return o
+def pkg(n,v,req=(),prov=(),conf=(),obs=(),rec=()):
+    sha=hashlib.sha256((n+v).encode()).hexdigest()
+    return '<package type="rpm"><name>%s</name><arch>x86_64</arch><version epoch="0" ver="%s" rel="1"/><checksum type="sha256" pkgid="YES">%s</checksum><summary>%s</summary><description>%s</description><size package="1000" installed="2000" archive="2000"/><location href="Packages/%s-%s-1.x86_64.rpm"/><format><rpm:provides><rpm:entry name="%s" flags="EQ" epoch="0" ver="%s" rel="1"/>%s</rpm:provides><rpm:requires>%s</rpm:requires><rpm:conflicts>%s</rpm:conflicts><rpm:obsoletes>%s</rpm:obsoletes><rpm:recommends>%s</rpm:recommends></format></package>'%(n,v,sha,n,n,n,v,n,v,ent(prov),ent(req),ent(conf),ent(obs),ent(rec))
+ns='xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm"'
+def doc(pk): return '<?xml version="1.0" encoding="UTF-8"?>\n<metadata %s packages="%d">\n%s\n</metadata>\n'%(ns,len(pk),'\n'.join(pk))
+repo=[pkg('app','2.0',req=['libfoo >= 1.5']),pkg('app','1.0',req=['libfoo']),pkg('libfoo','1.5'),pkg('libfoo','1.0'),
+      pkg('libfoo','2.0',conf=['oldthing']),pkg('oldthing','1.0'),pkg('broken','1.0',req=['doesnotexist']),
+      pkg('libold','1.0'),pkg('libnew','1.0',obs=['libold < 2'],prov=['libold = 2']),
+      pkg('mail-a','1.0',prov=['mta']),pkg('needsmta','1.0',req=['mta']),pkg('lib-aaa','1.0'),pkg('lib-bbb','1.0')]
+x=doc(repo).encode(); gz=gzip.compress(x)
+open(w+'/repo/repodata/primary.xml.gz','wb').write(gz)
+open(w+'/repo/repodata/repomd.xml','w').write('<?xml version="1.0"?>\n<repomd>\n<data type="primary">\n<checksum type="sha256">%s</checksum>\n<location href="repodata/primary.xml.gz"/>\n</data>\n</repomd>\n'%hashlib.sha256(gz).hexdigest())
+open(w+'/installed.xml','w').write(doc([pkg('app','1.0',req=['libfoo']),pkg('libfoo','1.0'),pkg('libold','1.0'),pkg('oldthing','1.0')]))
+open(w+'/repos.hk','w').write('[repos]\n-> t\n--> baseurl => file://%s/repo\n--> gpgcheck => false\n'%w)
+PY
+S() { "$LEPM" solve --repos repos.hk --cache "$W/cache" "$@" 2>&1 || true; }
+fail=0
+expect() { local name="$1" pat="$2"; shift 2; local out; out="$(S "$@")"; if grep -qE "$pat" <<<"$out"; then echo "ok   $name"; else echo "FAIL $name"; echo "$out" | sed 's/^/     /'; fail=1; fi; }
+expect "install z zależnością"        'install libfoo-2.0'               --pkg app
+expect "ograniczenie wersji (<2)"     'install app-1.0'                  --pkg 'app<2'
+expect "glob"                         'install lib-aaa.*\n?.*lib-bbb|lib-bbb' --pkg 'lib-*'
+expect "provides:"                    'install mail-a'                   --pkg provides:mta --pkg needsmta
+expect "brak zależności (problem)"    'nothing provides doesnotexist'    --pkg broken
+expect "konflikt"                     'conflicts with'                   --pkg libfoo=2.0 --pkg oldthing
+expect "update-all: upgrade"          'upgrade app-2.0'                  --installed installed.xml --update-all
+expect "update-all: obsoletes -> erase" 'erase libold-1.0'               --installed installed.xml --update-all
+expect "update jednego"               'upgrade libfoo-1.5'               --installed installed.xml --update libfoo
+expect "erase + cleandeps"            'erase libfoo-1.0'                 --installed installed.xml --erase app --opt cleandeps
+expect "erase bez cleandeps zostawia" '^  1 zmian'                       --installed installed.xml --erase app
+expect "erase łamiący zależność"      'requires libfoo'                  --installed installed.xml --erase libfoo
+expect "zła opcja"                    'nieznana opcja solvera'           --pkg app --opt bogus
+expect "wstrzykiwanie w nazwie"       'niepoprawna'                      --pkg 'a;rm -rf /'
+[ "$fail" = 0 ] && echo "solver-e2e: OK" || { echo "solver-e2e: BŁĘDY"; exit 1; }
