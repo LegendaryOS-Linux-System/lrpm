@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Testy czystej logiki lrpm (bez bibliotek bit — N4: `h# test` z bibliotekami bit uruchamia też ich testy).
+set -u
+cd "$(dirname "$0")/.."
+H="${HSHARP:-h#}"; fail=0
+for f in src/tests/pure_test.h# src/tests/lpath_test.h#; do
+  out="$($H test "$f" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ]; then fail=1; echo "✗ $f"; echo "$out" | tail -20; else echo "✓ $f"; fi
+done
+exit $fail
