@@ -20,10 +20,147 @@ pub struct Solution is
     pub error:    string
     pub problems: [string]
     pub steps:    [pure::Step]
+    pub removals: [string]   ;; NEVRA pakietów do usunięcia (bez atrap)
+    pub actions:  [string]   ;; "rodzaj TAB nevra": install|upgrade|downgrade|reinstall|change|obsoletes|erase
+    pub warnings: [string]   ;; np. specyfikacja, która nic nie dopasowała
 end
 
 fn fail(msg: string) -> Solution is
-    return Solution { ok: false, error: msg, problems: [], steps: [] }
+    return Solution { ok: false, error: msg, problems: [], steps: [], removals: [], actions: [], warnings: [] }
+end
+
+;; Opcje solvera (tokeny): allow-downgrade allow-archchange allow-vendorchange allow-uninstall keep-orphans
+;; focus-installed strict-priority install-also-updates best no-weak cleandeps
+;; oraz lock=NAZWA, favor=NAZWA, disfavor=NAZWA, multiversion=NAZWA. Nieznany token => błąd.
+pub fn known_opt(o: string) -> bool is
+    let k: [string] = ["allow-downgrade", "allow-archchange", "allow-vendorchange", "allow-uninstall", "keep-orphans",
+        "focus-installed", "strict-priority", "install-also-updates", "best", "no-weak", "cleandeps"]
+    let mut i: int = 0
+    while i < k.len() is
+        if k[i] == o is return true end
+        i += 1
+    end
+    let eq: int = pure::find(o, "=")
+    if eq > 0 is
+        let key: string = o[0..eq]
+        if (key == "lock" || key == "favor" || key == "disfavor" || key == "multiversion") && pure::safe_name(o[eq + 1..o.len()]) is return true end
+    end
+    return false
+end
+
+pub fn check_opts(opts: [string]) -> string is
+    let mut i: int = 0
+    while i < opts.len() is
+        if !known_opt(opts[i]) is return "nieznana opcja solvera: '" + opts[i] + "'" end
+        i += 1
+    end
+    return ""
+end
+
+fn has_opt(opts: [string], o: string) -> bool is
+    let mut i: int = 0
+    while i < opts.len() is
+        if opts[i] == o is return true end
+        i += 1
+    end
+    return false
+end
+
+fn opt_values(opts: [string], key: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < opts.len() is
+        if pure::starts_with(opts[i], key + "=") is out.push(opts[i][key.len() + 1..opts[i].len()]) end
+        i += 1
+    end
+    return out
+end
+
+;; Flagi solvera ustawiane tokenami (numery z satsolv/solver.h#; stałe przez alias kompilują się do 0).
+fn apply_flags(s: int, opts: [string], weak_deps: bool) is
+    let mut f: i32 = 0
+    if !weak_deps || has_opt(opts, "no-weak") is f = sv::solver::set_flag_value(s, 7, true) end
+    if has_opt(opts, "allow-downgrade")     is f = sv::solver::set_flag_value(s, 1, true) end
+    if has_opt(opts, "allow-archchange")    is f = sv::solver::set_flag_value(s, 2, true) end
+    if has_opt(opts, "allow-vendorchange")  is f = sv::solver::set_flag_value(s, 3, true) end
+    if has_opt(opts, "allow-uninstall")     is f = sv::solver::set_flag_value(s, 4, true) end
+    if has_opt(opts, "keep-orphans")        is f = sv::solver::set_flag_value(s, 18, true) end
+    if has_opt(opts, "focus-installed")     is f = sv::solver::set_flag_value(s, 20, true) end
+    if has_opt(opts, "strict-priority")     is f = sv::solver::set_flag_value(s, 28, true) end
+    if has_opt(opts, "install-also-updates") is f = sv::solver::set_flag_value(s, 26, true) end
+end
+
+;; Operator relacji w specyfikacji -> (pozycja, długość, flagi REL_*: GT=1, EQ=2, LT=4).
+fn find_op(spec: string) -> [int] is
+    let ops: [string] = [">=", "<=", "!=", "==", "=", ">", "<"]
+    let fl: [int] = [3, 6, 5, 2, 2, 1, 4]
+    let mut best: int = -1
+    let mut bl: int = 0
+    let mut bf: int = 0
+    let mut i: int = 0
+    while i < ops.len() is
+        let at: int = pure::find(spec, ops[i])
+        if at > 0 && (best < 0 || at < best) is
+            best = at
+            bl = ops[i].len()
+            bf = fl[i]
+        end
+        i += 1
+    end
+    return [best, bl, bf]
+end
+
+fn safe_ver(v: string) -> bool is
+    if v.len() == 0 || v.len() > 80 is return false end
+    let mut i: int = 0
+    while i < v.len() is
+        let c: string = v[i..i + 1]
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "." || c == "_" || c == "+" || c == "~" || c == "^" || c == "-" || c == ":"
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+;; Specyfikacje: `nazwa`, `nazwa>=1.2`, `nazwa=1.2-3`, glob `lib*`, `provides:/usr/bin/foo`, `provides:libfoo.so.1()(64bit)`.
+;; Zwraca "" gdy poprawna; inaczej opis. Bezpieczna: żadna część nie trafia do powłoki.
+pub fn check_spec(spec: string) -> string is
+    if pure::starts_with(spec, "provides:") is
+        let d: string = spec[9..spec.len()]
+        if d.len() == 0 || d.len() > 200 || pure::find(d, "'") >= 0 || pure::find(d, "\"") >= 0 || pure::find(d, ";") >= 0 || pure::find(d, "$") >= 0 || pure::find(d, "`") >= 0 || pure::find(d, "\n") >= 0 is
+            return "niepoprawna zależność w '" + spec + "'"
+        end
+        return ""
+    end
+    let o: [int] = find_op(spec)
+    if o[0] > 0 is
+        if !pure::safe_name(spec[0..o[0]]) || !safe_ver(spec[o[0] + o[1]..spec.len()]) is return "niepoprawna specyfikacja wersji: '" + spec + "'" end
+        return ""
+    end
+    if !pure::safe_name(spec) is return "niepoprawna nazwa pakietu: '" + spec + "'" end
+    return ""
+end
+
+;; Dokłada job (action: 256 install, 512 erase, 768 update, 1536 lock, 3072 favor, 3328 disfavor, 1280 multiversion;
+;; extra: bity 65536 weak, 262144 cleandeps, 1048576 forcebest). Zwraca liczbę dodanych jobów (0 = nic nie pasuje).
+fn add_job(jobs: int, p: int, spec: string, action: int, extra: int) -> int is
+    if pure::starts_with(spec, "provides:") is
+        return sv::job::push_selection(jobs, p, spec[9..spec.len()], 2, action + extra)
+    end
+    if pure::find(spec, "*") >= 0 || pure::find(spec, "?") >= 0 is
+        return sv::job::push_selection(jobs, p, spec, 513, action + extra)
+    end
+    let o: [int] = find_op(spec)
+    if o[0] > 0 is
+        let nid: i32 = sv::pool::str_to_id(p, spec[0..o[0]], true)
+        let eid: i32 = sv::pool::str_to_id(p, spec[o[0] + o[1]..spec.len()], true)
+        let rel: i32 = sv::pool::rel_to_id(p, nid, eid, o[2])
+        sv::queue::push2(jobs, 2 + action + extra, rel)
+        return 1
+    end
+    let id: i32 = sv::pool::str_to_id(p, spec, true)
+    sv::queue::push2(jobs, 2 + action + extra, id)
+    return 1
 end
 
 ;; Plik rpm-md z atrapami z polityki ("" gdy brak atrap albo błąd w `err`).
@@ -86,11 +223,38 @@ end
 ;; Główna funkcja. `installed_xml` = "" → nic nie jest zainstalowane (budowa obrazu).
 pub fn resolve(cache: string, repos: [conf::Repo], pol: policy::Policy, arch: string,
                installed_xml: string, want: [string], erase: [string]) -> Solution is
+    return resolve_req(cache, repos, pol, arch, installed_xml, want, erase, [], "", [])
+end
+
+;; Pełne żądanie: install (want), erase, update (nazwy), mode: "" | "update-all" | "dist-upgrade" | "verify", opts (patrz known_opt).
+pub fn resolve_req(cache: string, repos: [conf::Repo], pol: policy::Policy, arch: string,
+               installed_xml: string, want: [string], erase: [string], update: [string], mode: string, opts: [string]) -> Solution is
+    let oe: string = check_opts(opts)
+    if oe != "" is return fail(oe) end
+    if mode != "" && mode != "update-all" && mode != "dist-upgrade" && mode != "verify" is return fail("nieznany tryb solvera: '" + mode + "'") end
     let mut k: int = 0
     while k < want.len() is
-        if !pure::safe_name(want[k]) is return fail("niepoprawna nazwa pakietu: '" + want[k] + "'") end
+        let ce: string = check_spec(want[k])
+        if ce != "" is return fail(ce) end
         k += 1
     end
+    let mut ke: int = 0
+    while ke < erase.len() is
+        let ce2: string = check_spec(erase[ke])
+        if ce2 != "" is return fail(ce2) end
+        ke += 1
+    end
+    let mut ku: int = 0
+    while ku < update.len() is
+        let ce3: string = check_spec(update[ku])
+        if ce3 != "" is return fail(ce3) end
+        ku += 1
+    end
+    let mut warns: [string] = []
+    let mut extra_i: int = 0
+    if has_opt(opts, "best") is extra_i = 1048576 end
+    let mut extra_e: int = 0
+    if has_opt(opts, "cleandeps") is extra_e = 262144 end
     let p: int = sv::pool::new()
     sv::pool::set_arch(p, arch)
     let mut handles: [int] = []
@@ -155,30 +319,63 @@ pub fn resolve(cache: string, repos: [conf::Repo], pol: policy::Policy, arch: st
     let jobs: int = sv::queue::new()
     let mut w: int = 0
     while w < want.len() is
-        sv::job::install_name(jobs, p, want[w])
+        let n1: int = add_job(jobs, p, want[w], 256, extra_i)
+        if n1 == 0 is warns.push("install: nic nie pasuje do '" + want[w] + "'") end
         w += 1
     end
     let mut x: int = 0
     while x < pol.exclude.len() is
-        sv::job::erase_name(jobs, p, pol.exclude[x])
+        let n2: int = add_job(jobs, p, pol.exclude[x], 512, 0)
         x += 1
     end
     let mut y: int = 0
     while y < erase.len() is
-        sv::job::erase_name(jobs, p, erase[y])
+        let n3: int = add_job(jobs, p, erase[y], 512, extra_e)
+        if n3 == 0 is warns.push("erase: nic nie pasuje do '" + erase[y] + "'") end
         y += 1
     end
-    let s: int = sv::solver::new(p)
-    if !pol.weak_deps is
-        let f0: i32 = sv::solver::set_flag_value(s, 7, true)
+    let mut u: int = 0
+    while u < update.len() is
+        let n4: int = add_job(jobs, p, update[u], 768, extra_i)
+        if n4 == 0 is warns.push("update: nic nie pasuje do '" + update[u] + "'") end
+        u += 1
     end
+    let locks: [string] = opt_values(opts, "lock")
+    let mut lk: int = 0
+    while lk < locks.len() is
+        let n5: int = add_job(jobs, p, locks[lk], 1536, 0)
+        lk += 1
+    end
+    let favs: [string] = opt_values(opts, "favor")
+    let mut fv: int = 0
+    while fv < favs.len() is
+        let n6: int = add_job(jobs, p, favs[fv], 3072, 0)
+        fv += 1
+    end
+    let disf: [string] = opt_values(opts, "disfavor")
+    let mut dv: int = 0
+    while dv < disf.len() is
+        let n7: int = add_job(jobs, p, disf[dv], 3328, 0)
+        dv += 1
+    end
+    let mv: [string] = opt_values(opts, "multiversion")
+    let mut mi: int = 0
+    while mi < mv.len() is
+        let n8: int = add_job(jobs, p, mv[mi], 1280, 0)
+        mi += 1
+    end
+    if mode == "update-all"   is sv::queue::push2(jobs, 6 + 768 + extra_i, 0) end
+    if mode == "dist-upgrade" is sv::queue::push2(jobs, 6 + 1792, 0) end
+    if mode == "verify"       is sv::queue::push2(jobs, 6 + 2048, 0) end
+    let s: int = sv::solver::new(p)
+    apply_flags(s, opts, pol.weak_deps)
     let nprob: i32 = sv::solver::run(s, jobs)
     if nprob > 0 is
         let probs: [string] = sv::solver::all_problems_as_strings(s)
         sv::queue::destroy(jobs)
         sv::solver::destroy(s)
         sv::pool::destroy(p)
-        return Solution { ok: false, error: "nie da się rozwiązać zależności", problems: probs, steps: [] }
+        return Solution { ok: false, error: "nie da się rozwiązać zależności", problems: probs, steps: [], removals: [], actions: [], warnings: warns }
     end
     let plan = sv::transaction::build_plan(p, s)
     let lines: [string] = sv::transaction::plan_lines(plan)
@@ -193,12 +390,19 @@ pub fn resolve(cache: string, repos: [conf::Repo], pol: policy::Policy, arch: st
 
     ;; install/upgrade/downgrade/reinstall → NEVRA (bez atrap)
     let mut nevras: [string] = []
+    let mut removals: [string] = []
+    let mut actions: [string] = []
     let mut l: int = 0
     while l < lines.len() is
         let pl: [string] = pure::split_plan_line(lines[l])
         l += 1
-        if pl[0] == "install" || pl[0] == "upgrade" || pl[0] == "downgrade" || pl[0] == "reinstall" is
+        if pl[0] == "install" || pl[0] == "upgrade" || pl[0] == "downgrade" || pl[0] == "reinstall" || pl[0] == "change" || pl[0] == "obsoletes" || pl[0] == "multiinstall" || pl[0] == "multireinstall" is
             nevras.push(pl[1])
+            if !pure::starts_with(pl[1], pure::stub_prefix()) is actions.push(pl[0] + pure::tab() + pl[1]) end
+        end
+        if pl[0] == "erase" && !pure::starts_with(pl[1], pure::stub_prefix()) is
+            removals.push(pl[1])
+            actions.push("erase" + pure::tab() + pl[1])
         end
     end
     let found: [pure::Step] = lookup(cache, repos, nevras)
@@ -222,5 +426,5 @@ pub fn resolve(cache: string, repos: [conf::Repo], pol: policy::Policy, arch: st
         end
         n += 1
     end
-    return Solution { ok: true, error: "", problems: [], steps: pure::order_steps(steps) }
+    return Solution { ok: true, error: "", problems: [], steps: pure::order_steps(steps), removals: removals, actions: actions, warnings: warns }
 end
