@@ -26,6 +26,9 @@ pub struct Request is
     pub installed_xml: string   ;; "" = nic nie zainstalowane (budowa obrazu)
     pub want:          [string]
     pub erase:         [string]
+    pub update:        [string]   ;; nazwy/specyfikacje do aktualizacji
+    pub mode:          string     ;; "" | "update-all" | "dist-upgrade" | "verify"
+    pub opts:          [string]   ;; opcje solvera (solve::known_opt)
 end
 
 pub struct Prepared is
@@ -35,10 +38,13 @@ pub struct Prepared is
     pub steps:    [pure::Step]
     pub files:    [string]      ;; ścieżki RPM równolegle do steps (puste przy download=false)
     pub blocks:   string        ;; plik z blokami <package> nowych pakietów (do instdb::merge)
+    pub removals: [string]      ;; NEVRA pakietów do usunięcia z systemu
+    pub actions:  [string]      ;; "rodzaj TAB nevra" (install/upgrade/downgrade/erase/…)
+    pub warnings: [string]
 end
 
 fn pfail(msg: string) -> Prepared is
-    return Prepared { ok: false, error: msg, problems: [], steps: [], files: [], blocks: "" }
+    return Prepared { ok: false, error: msg, problems: [], steps: [], files: [], blocks: "", removals: [], actions: [], warnings: [] }
 end
 
 ;; Samo odświeżenie metadanych (lpm sync).
@@ -63,12 +69,12 @@ pub fn prepare(r: Request, download: bool) -> Prepared is
     if pv.len() > 0 is return pfail("compat.hk: " + pv[0]) end
     let se: string = meta::sync_all(r.cache, repos)
     if se != "" is return pfail(se) end
-    let sol: solve::Solution = solve::resolve(r.cache, repos, pol, r.arch, r.installed_xml, r.want, r.erase)
+    let sol: solve::Solution = solve::resolve_req(r.cache, repos, pol, r.arch, r.installed_xml, r.want, r.erase, r.update, r.mode, r.opts)
     if !sol.ok is
-        return Prepared { ok: false, error: sol.error, problems: sol.problems, steps: [], files: [], blocks: "" }
+        return Prepared { ok: false, error: sol.error, problems: sol.problems, steps: [], files: [], blocks: "", removals: [], actions: [], warnings: sol.warnings }
     end
     if sol.steps.len() == 0 is
-        return Prepared { ok: true, error: "", problems: [], steps: [], files: [], blocks: "" }
+        return Prepared { ok: true, error: "", problems: [], steps: [], files: [], blocks: "", removals: sol.removals, actions: sol.actions, warnings: sol.warnings }
     end
     let mut files: [string] = []
     if download is
@@ -103,7 +109,7 @@ pub fn prepare(r: Request, download: bool) -> Prepared is
         end
         k += 1
     end
-    return Prepared { ok: true, error: "", problems: [], steps: sol.steps, files: files, blocks: blocks }
+    return Prepared { ok: true, error: "", problems: [], steps: sol.steps, files: files, blocks: blocks, removals: sol.removals, actions: sol.actions, warnings: sol.warnings }
 end
 
 pub struct Installed is
@@ -142,7 +148,7 @@ end
 fn mkreq(cache: string, repos_file: string, policy_file: string, releasever: string, arch: string,
          installed_xml: string, want: [string], erase: [string]) -> Request is
     return Request { cache: cache, repos_file: repos_file, policy_file: policy_file, releasever: releasever,
-        arch: arch, installed_xml: installed_xml, want: want, erase: erase }
+        arch: arch, installed_xml: installed_xml, want: want, erase: erase, update: [], mode: "", opts: [] }
 end
 
 ;; Planowanie (+ opcjonalnie pobranie) jako wiersze TSV:
@@ -176,11 +182,98 @@ pub fn flat_prepare(cache: string, repos_file: string, policy_file: string, rele
     return out
 end
 
+
+;; Pełne żądanie solvera (lpm solve/upgrade, lepm): wiersze TSV jak w flat_prepare, a dodatkowo
+;;   A TAB rodzaj TAB nevra      — akcja (install/upgrade/downgrade/reinstall/erase/…)
+;;   R TAB nevra                 — pakiet do usunięcia
+;;   W TAB ostrzeżenie
+;; `download` = false → sam plan (nic nie jest pobierane).
+pub fn flat_solve(cache: string, repos_file: string, policy_file: string, releasever: string, arch: string,
+                  installed_xml: string, want: [string], erase: [string], update: [string], mode: string,
+                  opts: [string], download: bool) -> [string] is
+    let mut rq: Request = mkreq(cache, repos_file, policy_file, releasever, arch, installed_xml, want, erase)
+    rq.update = update
+    rq.mode = mode
+    rq.opts = opts
+    let p: Prepared = prepare(rq, download)
+    let t: string = pure::tab()
+    let mut out: [string] = []
+    if !p.ok is
+        out.push("E" + t + p.error)
+        let mut i: int = 0
+        while i < p.problems.len() is
+            out.push("P" + t + p.problems[i])
+            i += 1
+        end
+        let mut w0: int = 0
+        while w0 < p.warnings.len() is
+            out.push("W" + t + p.warnings[w0])
+            w0 += 1
+        end
+        return out
+    end
+    let mut w: int = 0
+    while w < p.warnings.len() is
+        out.push("W" + t + p.warnings[w])
+        w += 1
+    end
+    let mut a: int = 0
+    while a < p.actions.len() is
+        out.push("A" + t + p.actions[a])
+        a += 1
+    end
+    let mut r: int = 0
+    while r < p.removals.len() is
+        out.push("R" + t + p.removals[r])
+        r += 1
+    end
+    let mut k: int = 0
+    while k < p.steps.len() is
+        let s: pure::Step = p.steps[k]
+        let mut f: string = ""
+        if k < p.files.len() is f = p.files[k] end
+        out.push("S" + t + s.name + t + pure::nevra(s) + t + f + t + s.repo + t + pure::evr(s.epoch, s.ver, s.rel) + t + s.arch + t + s.sha256 + t + pure::int_str(s.size))
+        k += 1
+    end
+    if p.blocks != "" is out.push("B" + t + p.blocks) end
+    return out
+end
+
+;; Sprawdza specyfikacje/opcje bez sieci i solvera (CLI: szybki błąd przed synchronizacją).
+pub fn check_request(want: [string], erase: [string], update: [string], opts: [string]) -> string is
+    let mut i: int = 0
+    while i < want.len() is
+        let e: string = solve::check_spec(want[i])
+        if e != "" is return e end
+        i += 1
+    end
+    let mut j: int = 0
+    while j < erase.len() is
+        let e2: string = solve::check_spec(erase[j])
+        if e2 != "" is return e2 end
+        j += 1
+    end
+    let mut k: int = 0
+    while k < update.len() is
+        let e3: string = solve::check_spec(update[k])
+        if e3 != "" is return e3 end
+        k += 1
+    end
+    return solve::check_opts(opts)
+end
+
 ;; Budowa rootfs od zera (lepm). Wynik: [błąd, wiersze raportu…]; błąd "" = sukces.
 ;; Raport: "+ nevra" dla każdego pakietu, "! ostrzeżenie" dla hooków.
 pub fn bootstrap(root: string, cache: string, repos_file: string, policy_file: string, releasever: string,
                  arch: string, want: [string], dry: bool) -> [string] is
-    let rq: Request = mkreq(cache, repos_file, policy_file, releasever, arch, "", want, [])
+    return bootstrap_ex(root, cache, repos_file, policy_file, releasever, arch, want, [], [], dry)
+end
+
+;; j.w., plus erase (pakiety, których ma NIE być w obrazie) i opcje solvera.
+pub fn bootstrap_ex(root: string, cache: string, repos_file: string, policy_file: string, releasever: string,
+                 arch: string, want: [string], erase: [string], opts: [string], dry: bool) -> [string] is
+    let mut rq: Request = mkreq(cache, repos_file, policy_file, releasever, arch, "", want, erase)
+    rq.opts = opts
     let p: Prepared = prepare(rq, !dry)
     if !p.ok is
         let mut e: [string] = [p.error]
@@ -240,3 +333,30 @@ pub fn run_triggers(root: string, policy_file: string) -> [string] is
     end
     return out
 end
+
+;; ── pomocniki dla CLI (lepm) ──
+pub fn pid_str() -> string is return ft::text::istr(ft::sys::pid()) end
+
+;; Ścieżka bezpieczna do rm -rf: bezwzględna, głębokość >= 2, bez "..", bez znaków sterujących powłoki.
+pub fn safe_cache_path(p: string) -> bool is
+    if !pure::starts_with(p, "/") || p.len() < 5 || pure::find(p, "..") >= 0 is return false end
+    let mut i: int = 0
+    while i < p.len() is
+        let c: string = p[i..i + 1]
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "/" || c == "." || c == "_" || c == "-"
+        if !ok is return false end
+        i += 1
+    end
+    return pure::find(p[1..p.len()], "/") >= 0
+end
+
+pub fn clear_dir(p: string) -> string is
+    if !safe_cache_path(p) is return "niebezpieczna ścieżka cache: '" + p + "'" end
+    return meta::run("find " + ft::sys::sq(p) + " -mindepth 1 -delete")
+end
+
+pub fn remove_file(p: string) is
+    let e: string = meta::run("rm -f -- " + ft::sys::sq(p))
+end
+
+pub fn make_dir(p: string) -> string is return meta::run("mkdir -p -- " + ft::sys::sq(p)) end
