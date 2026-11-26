@@ -20,9 +20,6 @@
 --> run => scripts/run-tests.sh
 --> description => Testy czystej logiki: pure + lpath (bez bibliotek bit — N4)
 
-! libfasttree: tylko jako biblioteka (use "bit -> libfasttree" w src/lib.h#); satsolv: solver zależności.
 [dependencies]
 -> libfasttree => newest
 -> satsolv => newest
-
-! Narzędzia zewnętrzne (nie biblioteki): curl, gawk, bsdtar, zstd|gzip|xz, sha256sum, rpmkeys (tylko gpgcheck=true).
