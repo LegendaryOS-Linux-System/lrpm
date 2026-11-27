@@ -20,7 +20,8 @@ end
 #[test]
 fn awk_placeholders_expand() is
     let s: string = pure::aw("@L@print @Q@x@Q@@T@@R@")
-    test::assert_true(s.len() == 10)
+    test::assert_true(s.len() == 12)
+    test::assert_true(s[11..12] == __builtin_char_code_to_str(125))
     test::assert_true(s[0..1] == __builtin_char_code_to_str(123))
 end
 
