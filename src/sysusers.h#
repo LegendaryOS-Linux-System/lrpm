@@ -156,9 +156,9 @@ pub fn apply(root: string) -> string is
             end
         end
     end
-    if !fs::write(pp, passwd) is return "nie można zapisać " + pp end
-    if !fs::write(gp, group) is return "nie można zapisać " + gp end
-    if !fs::write(sp, shadow) is return "nie można zapisać " + sp end
-    if !fs::write(gsp, gshadow) is return "nie można zapisać " + gsp end
+    if !ft::sys::write_text(pp, passwd) is return "nie można zapisać " + pp end
+    if !ft::sys::write_text(gp, group) is return "nie można zapisać " + gp end
+    if !ft::sys::write_text(sp, shadow) is return "nie można zapisać " + sp end
+    if !ft::sys::write_text(gsp, gshadow) is return "nie można zapisać " + gsp end
     return ""
 end
