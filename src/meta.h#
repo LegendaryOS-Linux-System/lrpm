@@ -94,7 +94,7 @@ pub fn sync(cache: string, r: conf::Repo) -> string is
     ft::sys::rm_f(named)
     e = build_index(primary_xml(cache, r.name), index_tsv(cache, r.name))
     if e != "" is return e end
-    if !fs::write(stamp, sha) is return "nie można zapisać " + stamp end
+    if !ft::sys::write_text(stamp, sha) is return "nie można zapisać " + stamp end
     return ""
 end
 
@@ -147,4 +147,10 @@ pub fn search(cache: string, repos: [conf::Repo], term: string) -> [string] is
         i += 1
     end
     return out
+end
+
+;; Zapis tekstu ATOMOWY (tmp + rename) niezależny od typu zwracanego `fs::write`
+;; w danej wersji stdlib H# (bool/void) — dla lepm, który nie importuje libfasttree.
+pub fn write_text(path: string, content: string) -> bool is
+    return ft::sys::write_text(path, content)
 end
