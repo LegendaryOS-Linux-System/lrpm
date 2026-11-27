@@ -102,7 +102,7 @@ pub fn prepare(r: Request, download: bool) -> Prepared is
         end
         if wants != "" is
             let wf: string = blocks + ".wants"
-            if !fs::write(wf, wants) is return pfail("nie można zapisać " + wf) end
+            if !ft::sys::write_text(wf, wants) is return pfail("nie można zapisać " + wf) end
             let be: string = instdb::extract_blocks(meta::primary_xml(r.cache, repos[k].name), wf, blocks)
             ft::sys::rm_f(wf)
             if be != "" is return pfail(be) end
