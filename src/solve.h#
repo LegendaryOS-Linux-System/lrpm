@@ -179,14 +179,14 @@ fn write_stubs(cache: string, repos: [conf::Repo], pol: policy::Policy, path: st
         n += 1
         i += 1
     end
-    if !fs::write(path, pure::metadata_header(n) + xml + pure::metadata_footer()) is return "nie można zapisać " + path end
+    if !ft::sys::write_text(path, pure::metadata_header(n) + xml + pure::metadata_footer()) is return "nie można zapisać " + path end
     return ""
 end
 
 ;; Dopasowanie NEVRA z planu do wpisów indeksu (jedno przejście gawk na repo).
 fn lookup(cache: string, repos: [conf::Repo], nevras: [string]) -> [pure::Step] is
     let wants: string = ft::text::path_join(cache, "wants.nevra")
-    let w: bool = fs::write(wants, pure::join(nevras, "\n") + "\n")
+    let w: bool = ft::sys::write_text(wants, pure::join(nevras, "\n") + "\n")
     let prog: string = pure::aw("BEGIN@L@while((getline l<wants)>0) w[l]=1@R@ @L@ e=($2==@Q@0@Q@||$2==@Q@@Q@)?@Q@@Q@:$2@Q@:@Q@; k=$1@Q@-@Q@e$3@Q@-@Q@$4@Q@.@Q@$5; if(k in w) print r@Q@@T@@Q@$0 @R@")
     let mut out: [pure::Step] = []
     let mut seen: [string] = []
