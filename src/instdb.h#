@@ -18,7 +18,7 @@ end
 pub fn wrap(blocks: string, count: int, out: string) -> string is
     let head: string = pure::metadata_header(count)
     let body: string = ""
-    if !fs::write(out, head) is return "nie można zapisać " + out end
+    if !ft::sys::write_text(out, head) is return "nie można zapisać " + out end
     let mut e: string = ""
     if fs::exists(blocks) is
         e = meta::run("cat " + ft::sys::sq(blocks) + " >> " + ft::sys::sq(out))
@@ -35,7 +35,7 @@ end
 ;; Zawartość installed.xml bez bloków pakietów o podanych nazwach → `out` (zwykły dokument).
 pub fn remove_names(xml: string, names: [string], out: string) -> string is
     let wf: string = out + ".names"
-    if !fs::write(wf, pure::join(names, "\n") + "\n") is return "nie można zapisać " + wf end
+    if !ft::sys::write_text(wf, pure::join(names, "\n") + "\n") is return "nie można zapisać " + wf end
     let tmp: string = out + ".blocks"
     let e: string = meta::run("gawk -v mode=drop -v wants=" + ft::sys::sq(wf) + " " + ft::sys::sq(blocks_awk()) + " " + ft::sys::sq(xml) + " > " + ft::sys::sq(tmp))
     if e != "" is return e end
