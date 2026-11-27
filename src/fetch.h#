@@ -28,13 +28,13 @@ end
 
 ;; Importuje klucze GPG repozytoriów z gpgcheck=true do <cache>/rpmdb. "" albo błąd.
 pub fn import_keys(cache: string, repos: [conf::Repo]) -> string is
-    let mut any: bool = false
+    let mut need_keys: bool = false
     let mut i: int = 0
     while i < repos.len() is
-        if repos[i].enabled && repos[i].gpgcheck && repos[i].gpgkey != "" is any = true end
+        if repos[i].enabled && repos[i].gpgcheck && repos[i].gpgkey != "" is need_keys = true end
         i += 1
     end
-    if !any is return "" end
+    if !need_keys is return "" end
     if !ft::sys::have_tool("rpmkeys") is return "gpgcheck=true wymaga `rpmkeys` (pakiet rpm) albo ustaw gpgcheck => false w repos.hk" end
     let db: string = ft::text::path_join(cache, "rpmdb")
     let kd: string = ft::text::path_join(cache, "keys")
@@ -84,7 +84,7 @@ pub fn fetch_all(cache: string, repos: [conf::Repo], steps: [pure::Step]) -> str
     end
     if todo > 0 is
         let cf: string = ft::text::path_join(cache, "curl.cfg")
-        if !fs::write(cf, cfg) is return "nie można zapisać " + cf end
+        if !ft::sys::write_text(cf, cfg) is return "nie można zapisać " + cf end
         let e: string = meta::run("curl -fsSL --retry 3 --parallel --parallel-max 8 --create-dirs -K " + ft::sys::sq(cf))
         ft::sys::rm_f(cf)
         if e != "" is return e end
